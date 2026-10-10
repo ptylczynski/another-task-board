@@ -1,7 +1,9 @@
-"""Login gate with two methods: credentials from environment variables, or OIDC via st.login.
+"""Login gate with two methods that work side by side: the administrator signs in with the login and
+password from environment variables, and everyone else through OIDC via st.login.
 
-Only one method is active at a time. Environment credentials win when both are configured.
-Setting TASKBOARD_AUTH_DISABLED skips authentication entirely, overriding both.
+Each person gets their own account: the administrator one, and one per OIDC user, created on their
+first sign-in. Only the administrator can open the admin panel. Setting TASKBOARD_AUTH_DISABLED
+skips authentication entirely: everyone shares one anonymous account and there's no administrator.
 
 OIDC settings come from `[auth]` in `.streamlit/secrets.toml`, or from TASKBOARD_OIDC_* environment
 variables when the app is started through `asgi_app.py`, which passes them in as secrets.
@@ -20,6 +22,13 @@ AUTH_DISABLED_ENV = "TASKBOARD_AUTH_DISABLED"
 TRUE_VALUES = {"1", "true", "yes", "on"}
 FALSE_VALUES = {"", "0", "false", "no", "off"}
 FAILED_LOGIN_DELAY = 1  # seconds; slows down password guessing
+# A line under the user's name sets it apart from the links below it in the sidebar.
+ACCOUNT_CSS = """
+.st-key-sidebar_user {
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+}
+"""
 # [auth] secret key -> environment variable.
 OIDC_ENV = {
     "client_id": "TASKBOARD_OIDC_CLIENT_ID",
@@ -79,35 +88,28 @@ def oidc_providers():
     return providers
 
 
-def auth_mode():
+def current_account():
+    """The signed-in person, or None.
+
+    A dict with "identity" (stable across sign-ins and unique among accounts), "name", "email",
+    "method" ("disabled", "password" or "oidc") and "is_admin".
+    """
     if auth_disabled():
-        return "disabled"
-    if password_credentials():
-        return "password"
-    if oidc_providers():
-        return "oidc"
-    return None
-
-
-def both_configured():
-    return bool(password_credentials() and oidc_providers())
-
-
-BOTH_CONFIGURED_NOTE = (
-    f"Both password login (`{LOGIN_ENV}` / `{PASSWORD_ENV}`) and OIDC (`TASKBOARD_OIDC_*` "
-    "variables or `[auth]` in `.streamlit/secrets.toml`) are configured. Only password login is "
-    f"used; unset `{LOGIN_ENV}` / `{PASSWORD_ENV}` to switch to OIDC."
-)
-
-
-def current_user(mode):
-    """Display name of the signed-in user for the active mode, or None."""
-    if mode == "disabled":
-        return "Anonymous"
-    if mode == "password":
-        return st.session_state.get("auth_user")
-    if mode == "oidc" and st.user.get("is_logged_in", False):
-        return st.user.get("name") or st.user.get("email") or "Signed in"
+        return {"identity": "local", "name": "Anonymous", "email": None, "method": "disabled", "is_admin": False}
+    credentials = password_credentials()
+    login = st.session_state.get("auth_user")
+    # Checked against the current login, so changing it in the environment signs the old one out.
+    if credentials and login == credentials[0]:
+        return {"identity": f"password:{login}", "name": login, "email": None, "method": "password", "is_admin": True}
+    if oidc_providers() and st.user.get("is_logged_in", False):
+        # The issuer and subject together identify a person across OIDC providers.
+        return {
+            "identity": f"oidc:{st.user.get('iss')}:{st.user.get('sub')}",
+            "name": st.user.get("name") or st.user.get("email") or "Signed in",
+            "email": st.user.get("email"),
+            "method": "oidc",
+            "is_admin": False,
+        }
     return None
 
 
@@ -119,14 +121,24 @@ def _check_password(login, password):
     return login_ok and password_ok
 
 
+def _password_form():
+    with st.form("login_form", border=False):
+        login = st.text_input("Login", autocomplete="username")
+        password = st.text_input("Password", type="password", autocomplete="current-password")
+        submitted = st.form_submit_button("Log in", icon=":material/login:", type="primary")
+    if submitted:
+        if _check_password(login, password):
+            st.session_state.auth_user = login
+            st.rerun()
+        time.sleep(FAILED_LOGIN_DELAY)
+        st.error("Invalid login or password.")
+
+
 def login_page():
-    mode = auth_mode()
     with st.container(horizontal_alignment="center"):
         with st.container(border=True, width=420):
             st.subheader("Log in", anchor=False)
 
-            if both_configured():
-                st.info(BOTH_CONFIGURED_NOTE, icon=":material/info:")
             disabled_value = os.environ.get(AUTH_DISABLED_ENV, "").strip()
             if disabled_value.lower() not in TRUE_VALUES | FALSE_VALUES:
                 st.warning(
@@ -144,41 +156,38 @@ def login_page():
                     icon=":material/warning:",
                 )
 
-            if mode == "password":
-                with st.form("login_form", border=False):
-                    login = st.text_input("Login", autocomplete="username")
-                    password = st.text_input("Password", type="password", autocomplete="current-password")
-                    submitted = st.form_submit_button("Log in", icon=":material/login:", type="primary")
-                if submitted:
-                    if _check_password(login, password):
-                        st.session_state.auth_user = login
-                        st.rerun()
-                    time.sleep(FAILED_LOGIN_DELAY)
-                    st.error("Invalid login or password.")
-            elif mode == "oidc":
-                for provider in oidc_providers():
-                    label = f"Log in with {provider.capitalize()}" if provider else "Log in"
-                    if st.button(label, key=f"oidc_{provider}", icon=":material/login:", type="primary"):
-                        st.login(provider)
-            else:
+            providers = oidc_providers()
+            for provider in providers:
+                label = f"Log in with {provider.capitalize()}" if provider else "Log in"
+                if st.button(label, key=f"oidc_{provider}", icon=":material/login:", type="primary"):
+                    st.login(provider)
+            if password_credentials():
+                if providers:
+                    # Users sign in with OIDC above; the password is the administrator's.
+                    with st.expander("Administrator login", icon=":material/admin_panel_settings:"):
+                        _password_form()
+                else:
+                    _password_form()
+            elif not providers:
                 st.error(
                     "No login method is configured, so access is blocked. Set the "
-                    f"`{LOGIN_ENV}` and `{PASSWORD_ENV}` environment variables, or configure OIDC "
-                    "with the `TASKBOARD_OIDC_*` variables (run `asgi_app.py`) or under `[auth]` in "
-                    "`.streamlit/secrets.toml`. To run without login, set "
+                    f"`{LOGIN_ENV}` and `{PASSWORD_ENV}` environment variables for the administrator, "
+                    "and configure OIDC for everyone else with the `TASKBOARD_OIDC_*` variables (run "
+                    "`asgi_app.py`) or under `[auth]` in `.streamlit/secrets.toml`. To run without login, set "
                     f"`{AUTH_DISABLED_ENV}=1`.",
                     icon=":material/block:",
                 )
 
 
 def require_login(url_paths=()):
-    """Show the login page and stop the script unless a user is signed in. Returns the active mode.
+    """Show the login page and stop the script unless someone is signed in. Returns their account
+    (see current_account).
 
     The login page is also served at each of `url_paths`, so opening (or logging out on) one of the
     app's pages shows the login form instead of "Page not found", and logging in stays on that page.
     """
-    mode = auth_mode()
-    if not current_user(mode):
+    account = current_account()
+    if not account:
         pages = [st.Page(login_page, title="Log in", icon=":material/lock:", default=True)]
         pages += [
             st.Page(login_page, title="Log in", icon=":material/lock:", url_path=path)
@@ -186,26 +195,26 @@ def require_login(url_paths=()):
         ]
         st.navigation(pages, position="hidden").run()
         st.stop()
-    return mode
+    return account
 
 
-def account_sidebar(mode):
-    """Signed-in user, logout button, and the both-configured note, for the sidebar."""
-    if mode == "disabled":
+def account_sidebar(account, admin_page=None):
+    """The signed-in user, set apart from the links below it: `admin_page` (if given) and log out."""
+    if account["method"] == "disabled":
         st.caption(
             f":material/lock_open: Authentication is disabled (`{AUTH_DISABLED_ENV}`).",
             help="Anyone who can reach this app can use it. Unset the variable to require login.",
         )
         return
-    st.caption(f":material/account_circle: {current_user(mode)}")
-    if both_configured():
-        st.caption(
-            ":material/info: Password and OIDC login are both configured; only password login is used.",
-            help=BOTH_CONFIGURED_NOTE,
-        )
-    if st.button("Log out", icon=":material/logout:", type="tertiary"):
-        if mode == "oidc":
-            st.logout()
-        else:
-            st.session_state.pop("auth_user", None)
-            st.rerun()
+    with st.container(key="sidebar_account", gap="xsmall"):
+        role = " :small[:gray[Administrator]]" if account["is_admin"] else ""
+        with st.container(key="sidebar_user"):
+            st.markdown(f":material/account_circle: **{account['name']}**{role}")
+        if admin_page:
+            st.page_link(admin_page, width="stretch")
+        if st.button("Log out", icon=":material/logout:", type="tertiary"):
+            if account["method"] == "oidc":
+                st.logout()
+            else:
+                st.session_state.pop("auth_user", None)
+                st.rerun()
