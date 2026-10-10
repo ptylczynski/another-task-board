@@ -1,10 +1,13 @@
-"""Boards, tasks and attachment metadata in PostgreSQL. File contents live in S3 (see file_store).
+"""Accounts, boards, tasks and attachment metadata in PostgreSQL. File contents live in S3 (see
+file_store).
 
-Rows are returned as the dicts the app works with: times as epoch seconds (like time.time()), due
-dates as datetime.date, and each task's attachments under "files". The tables are created on first
-use.
+Every board belongs to one account, and tasks and their files belong to a board, so deleting an
+account deletes everything it owns. Rows are returned as the dicts the app works with: times as
+epoch seconds (like time.time()), due dates as datetime.date, and each task's attachments under
+"files". The tables are created on first use.
 """
 
+import uuid
 from datetime import UTC, datetime
 
 import sqlalchemy as sa
@@ -12,19 +15,35 @@ import streamlit as st
 
 from db import connection
 
-DEFAULT_BOARD_ID = "default"
 DEFAULT_BOARD_ICON = "📋"
+DEFAULT_BOARD_URL_PATH = "default"
 
 SCHEMA = [
     """
-    CREATE TABLE IF NOT EXISTS boards (
+    CREATE TABLE IF NOT EXISTS users (
         id text PRIMARY KEY,
+        -- How the person signs in, e.g. "password:<login>" or "oidc:<issuer>:<subject>".
+        identity text NOT NULL UNIQUE,
         name text NOT NULL,
-        icon text NOT NULL,
-        url_path text NOT NULL UNIQUE,
-        created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+        email text,
+        created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+        last_seen_at timestamptz NOT NULL DEFAULT clock_timestamp()
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS boards (
+        id text PRIMARY KEY,
+        user_id text NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+        name text NOT NULL,
+        icon text NOT NULL,
+        url_path text NOT NULL,
+        is_default boolean NOT NULL DEFAULT false,
+        created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+        UNIQUE (user_id, url_path)
+    )
+    """,
+    # Each account has exactly one default board, its landing page.
+    "CREATE UNIQUE INDEX IF NOT EXISTS boards_one_default ON boards (user_id) WHERE is_default",
     """
     CREATE TABLE IF NOT EXISTS tasks (
         id text PRIMARY KEY,
@@ -54,15 +73,11 @@ SCHEMA = [
     "CREATE INDEX IF NOT EXISTS task_files_task_id ON task_files (task_id)",
     """
     CREATE TABLE IF NOT EXISTS group_colors (
-        group_key text PRIMARY KEY,
-        color text NOT NULL
+        user_id text NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+        group_key text NOT NULL,
+        color text NOT NULL,
+        PRIMARY KEY (user_id, group_key)
     )
-    """,
-    # The default board always exists; it's the app's landing page.
-    f"""
-    INSERT INTO boards (id, name, icon, url_path)
-    VALUES ('{DEFAULT_BOARD_ID}', 'Default', '{DEFAULT_BOARD_ICON}', 'default')
-    ON CONFLICT DO NOTHING
     """,
 ]
 
@@ -93,17 +108,68 @@ def _rows(statement, params=None):
         return conn.execute(sa.text(statement), params or {}).mappings().all()
 
 
-def load_boards():
+def ensure_account(identity, name, email):
+    """Create the account on first sign-in, or refresh its details; returns the account's id.
+
+    Also creates the account's default board if it doesn't have one yet.
+    """
     ensure_schema()
+    with connection().engine.begin() as conn:
+        user_id = conn.execute(
+            sa.text(
+                """
+                INSERT INTO users (id, identity, name, email) VALUES (:id, :identity, :name, :email)
+                ON CONFLICT (identity) DO UPDATE
+                SET name = EXCLUDED.name, email = EXCLUDED.email, last_seen_at = clock_timestamp()
+                RETURNING id
+                """
+            ),
+            {"id": uuid.uuid4().hex, "identity": identity, "name": name, "email": email},
+        ).scalar_one()
+        conn.execute(
+            sa.text(
+                """
+                INSERT INTO boards (id, user_id, name, icon, url_path, is_default)
+                VALUES (:id, :user_id, 'Default', :icon, :url_path, true)
+                ON CONFLICT DO NOTHING
+                """
+            ),
+            {
+                "id": uuid.uuid4().hex,
+                "user_id": user_id,
+                "icon": DEFAULT_BOARD_ICON,
+                "url_path": DEFAULT_BOARD_URL_PATH,
+            },
+        )
+    return user_id
+
+
+def board_url_paths():
+    """The URL paths of every account's boards other than the default ones, for routing at login."""
+    ensure_schema()
+    return [row["url_path"] for row in _rows("SELECT DISTINCT url_path FROM boards WHERE NOT is_default")]
+
+
+def load_boards(user_id):
     return [
         dict(row)
-        for row in _rows("SELECT id, name, icon, url_path FROM boards ORDER BY created_at, id")
+        for row in _rows(
+            """
+            SELECT id, name, icon, url_path, is_default FROM boards
+            WHERE user_id = :user_id ORDER BY created_at, id
+            """,
+            {"user_id": user_id},
+        )
     ]
 
 
-def insert_board(board):
+def insert_board(user_id, board):
     _execute(
-        "INSERT INTO boards (id, name, icon, url_path) VALUES (:id, :name, :icon, :url_path)", board
+        """
+        INSERT INTO boards (id, user_id, name, icon, url_path)
+        VALUES (:id, :user_id, :name, :icon, :url_path)
+        """,
+        {"user_id": user_id, **board},
     )
 
 
@@ -118,15 +184,22 @@ def _file(row):
     }
 
 
-def load_tasks():
-    """All tasks in creation order, each with its files."""
-    ensure_schema()
+def load_tasks(user_id):
+    """The account's tasks in creation order, each with its files."""
     files = {}
-    for row in _rows("SELECT * FROM task_files ORDER BY created_at, id"):
+    for row in _rows(
+        """
+        SELECT f.* FROM task_files f
+        JOIN tasks t ON t.id = f.task_id JOIN boards b ON b.id = t.board_id
+        WHERE b.user_id = :user_id ORDER BY f.created_at, f.id
+        """,
+        {"user_id": user_id},
+    ):
         files.setdefault(row["task_id"], []).append(_file(row))
     return [
         {
             "id": row["id"],
+            "user_id": user_id,
             "board_id": row["board_id"],
             "name": row["name"],
             "description": row["description"],
@@ -136,7 +209,13 @@ def load_tasks():
             "done_at": _to_seconds(row["done_at"]),
             "files": files.get(row["id"], []),
         }
-        for row in _rows("SELECT * FROM tasks ORDER BY created_at, id")
+        for row in _rows(
+            """
+            SELECT t.* FROM tasks t JOIN boards b ON b.id = t.board_id
+            WHERE b.user_id = :user_id ORDER BY t.created_at, t.id
+            """,
+            {"user_id": user_id},
+        )
     ]
 
 
@@ -230,15 +309,47 @@ def delete_file(file_id):
     _execute("DELETE FROM task_files WHERE id = :id", {"id": file_id})
 
 
-def load_group_colors():
-    return {row["group_key"]: row["color"] for row in _rows("SELECT * FROM group_colors")}
+def load_group_colors(user_id):
+    return {
+        row["group_key"]: row["color"]
+        for row in _rows("SELECT * FROM group_colors WHERE user_id = :user_id", {"user_id": user_id})
+    }
 
 
-def save_group_color(group_key, color):
+def save_group_color(user_id, group_key, color):
     _execute(
         """
-        INSERT INTO group_colors (group_key, color) VALUES (:group_key, :color)
-        ON CONFLICT (group_key) DO UPDATE SET color = EXCLUDED.color
+        INSERT INTO group_colors (user_id, group_key, color) VALUES (:user_id, :group_key, :color)
+        ON CONFLICT (user_id, group_key) DO UPDATE SET color = EXCLUDED.color
         """,
-        {"group_key": group_key, "color": color},
+        {"user_id": user_id, "group_key": group_key, "color": color},
     )
+
+
+def load_accounts():
+    """Every account with how much it stores, the largest storage users first."""
+    return [
+        {
+            **row,
+            "created_at": _to_seconds(row["created_at"]),
+            "last_seen_at": _to_seconds(row["last_seen_at"]),
+        }
+        for row in _rows(
+            """
+            SELECT u.id, u.identity, u.name, u.email, u.created_at, u.last_seen_at,
+                   count(DISTINCT b.id) AS boards, count(DISTINCT t.id) AS tasks,
+                   count(f.id) AS files, coalesce(sum(f.size), 0)::bigint AS bytes
+            FROM users u
+            LEFT JOIN boards b ON b.user_id = u.id
+            LEFT JOIN tasks t ON t.board_id = b.id
+            LEFT JOIN task_files f ON f.task_id = t.id
+            GROUP BY u.id
+            ORDER BY bytes DESC, u.created_at
+            """
+        )
+    ]
+
+
+def delete_account(user_id):
+    """Delete the account with all its boards, tasks and file records (not the files' contents)."""
+    _execute("DELETE FROM users WHERE id = :id", {"id": user_id})
