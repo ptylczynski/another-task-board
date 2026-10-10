@@ -14,8 +14,49 @@ import streamlit as st
 from PIL import Image
 
 PREVIEW_CHARS = 20_000  # text previews are cut off after this many characters
-# Non-breaking spaces, so Markdown keeps the indentation of nested tree levels.
-TREE_INDENT = "\u00a0" * 4
+# The tree's connecting lines are drawn with borders rather than "│├└" characters: glyphs don't
+# fill the whole line height, so the vertical lines would break between rows.
+TREE_CSS = """
+.file-tree-guides {
+    display: flex;
+    height: 1.75rem;
+}
+.file-tree-guides span {
+    position: relative;
+    width: 1.25rem;
+    opacity: 0.4;
+}
+.file-tree-guides .pipe::before,
+.file-tree-guides .tee::before,
+.file-tree-guides .end::before {
+    content: "";
+    position: absolute;
+    left: 0.5rem;
+    top: 0;
+    bottom: 0;
+    border-left: 1px solid currentColor;
+}
+.file-tree-guides .end::before {
+    bottom: 50%;
+}
+.file-tree-guides .tee::after,
+.file-tree-guides .end::after {
+    content: "";
+    position: absolute;
+    left: 0.5rem;
+    right: 0.125rem;
+    top: 50%;
+    border-top: 1px solid currentColor;
+}
+/* File names in the tree are buttons; keep them as compact as the folder names around them. */
+[class*="st-key-file_open_"] button {
+    min-height: 0;
+    height: 1.5rem;
+}
+[class*="st-key-file_open_"] button p {
+    font-size: 0.875rem;
+}
+"""
 TEXT_TYPES = ("application/json", "application/xml", "application/x-yaml", "application/csv")
 
 
@@ -87,9 +128,11 @@ def _tree_node():
 
 
 def tree_lines(files):
-    """(connector, label, file or None for a folder) triples drawing the files as a tree.
+    """(guides, label, file or None for a folder) triples drawing the files as a tree.
 
-    Names containing "/" are nested into folders.
+    Guides name the line drawn in each indentation column: "pipe" continues an ancestor's line,
+    "blank" leaves the column empty, and the last one is "tee" or "end" (the last entry of a
+    folder). Names containing "/" are nested into folders.
     """
     root = _tree_node()
     for file in files:
@@ -101,18 +144,18 @@ def tree_lines(files):
 
     lines = []
 
-    def walk(node, prefix):
+    def walk(node, guides):
         entries = [
             (f":material/folder: {escape_markdown(name)}", None, child)
             for name, child in sorted(node["folders"].items(), key=lambda item: item[0].lower())
         ] + [(f"{file_icon(file)} {escape_markdown(name)}", file, None) for name, file in node["files"]]
         for i, (label, file, child) in enumerate(entries):
             last = i == len(entries) - 1
-            lines.append((f"{prefix}{'└─' if last else '├─'}\u00a0", label, file))
+            lines.append(([*guides, "end" if last else "tee"], label, file))
             if child:
-                walk(child, prefix + (TREE_INDENT if last else "│" + TREE_INDENT))
+                walk(child, [*guides, "blank" if last else "pipe"])
 
-    walk(root, "")
+    walk(root, [])
     return lines
 
 
@@ -237,9 +280,10 @@ def files_tree(task):
     # editor.
     with st.container(gap=None, key=f"file_tree_{task['id']}"):
         st.caption(":material/attach_file: Files")
-        for connector, label, file in tree_lines(files):
+        for guides, label, file in tree_lines(files):
             with st.container(horizontal=True, vertical_alignment="center", gap=None):
-                st.caption(connector, width="content")
+                spans = "".join(f'<span class="{guide}"></span>' for guide in guides)
+                st.html(f'<div class="file-tree-guides">{spans}</div>', width="content")
                 if file is None:
                     st.caption(label, width="content")
                 elif st.button(label, key=f"file_open_{file['id']}", type="tertiary"):
