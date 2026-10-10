@@ -62,8 +62,13 @@ def bucket():
     return s3_settings()["bucket"]
 
 
-def object_key(task_id, file_id):
-    return f"tasks/{task_id}/{file_id}"
+def account_prefix(user_id):
+    # Every object of an account shares this prefix, so deleting the account can sweep them all.
+    return f"users/{user_id}/"
+
+
+def object_key(user_id, task_id, file_id):
+    return f"{account_prefix(user_id)}tasks/{task_id}/{file_id}"
 
 
 def _ensure_bucket():
@@ -105,6 +110,18 @@ def read_file(key, version):
 
 def delete_file(key):
     client().delete_object(Bucket=bucket(), Key=key)
+
+
+def delete_prefix(prefix):
+    """Delete every object whose key starts with `prefix`."""
+    # Each page holds at most 1000 keys, the most one delete_objects call accepts.
+    for page in client().get_paginator("list_objects_v2").paginate(Bucket=bucket(), Prefix=prefix):
+        if objects := [{"Key": obj["Key"]} for obj in page.get("Contents", [])]:
+            result = client().delete_objects(
+                Bucket=bucket(), Delete={"Objects": objects, "Quiet": True}
+            )
+            if errors := result.get("Errors"):
+                raise RuntimeError(f"Couldn't delete {errors[0]['Key']}: {errors[0]['Message']}")
 
 
 def file_storage_sidebar():
