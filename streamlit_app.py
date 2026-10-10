@@ -13,6 +13,7 @@ from board_icons import EMOJIS, emoji_label, random_emoji
 from db import database_sidebar
 from task_dblclick import task_dblclick_listener
 from task_files import (
+    TREE_CSS,
     attach_files_button,
     attach_files_form,
     file_details,
@@ -404,14 +405,7 @@ st.html(f"""
     background-color: {page_background};
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
 }}
-/* File names in the tree are buttons; keep them as compact as the caption text around them. */
-[class*="st-key-file_open_"] button {{
-    min-height: 0;
-    height: 1.5rem;
-}}
-[class*="st-key-file_open_"] button p {{
-    font-size: 0.875rem;
-}}
+{TREE_CSS}
 /* Solid task rows so only the group box itself is tinted. */
 [class*="st-key-task_row_"] {{
     background-color: {page_background};
