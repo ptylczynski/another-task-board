@@ -16,8 +16,10 @@ export default function (component) {
     document.removeEventListener("dblclick", window.__taskDblClickHandler)
   }
   window.__taskDblClickHandler = (event) => {
-    // Double-clicking controls inside the row keeps their normal behavior.
+    // Double-clicking controls inside the row keeps their normal behavior, and so does the file
+    // tree, whose names open the file instead.
     if (event.target.closest('[data-testid="stCheckbox"], button, input, textarea')) return
+    if (event.target.closest('[class*="st-key-file_tree_"]')) return
     const row = event.target.closest(`[class*="${prefix}"]`)
     if (!row) return
     const rowClass = [...row.classList].find((c) => c.startsWith(prefix))
