@@ -2,3 +2,4 @@ streamlit[auth]
 sqlalchemy
 psycopg[binary]
 python-dotenv
+boto3
