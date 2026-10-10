@@ -72,7 +72,7 @@ def find_file(task, file_id):
     return next((f for f in task_files(task) if f["id"] == file_id), None)
 
 
-def stored_file(task_id, upload, file_id=None):
+def stored_file(task, upload, file_id=None):
     """Upload the file's contents to S3 and return its description, which isn't saved yet.
 
     Passing the id of an existing file replaces its contents.
@@ -83,15 +83,15 @@ def stored_file(task_id, upload, file_id=None):
         "name": upload.name,
         "type": upload.type or "application/octet-stream",
         "size": upload.size,
-        "key": file_store.object_key(task_id, file_id),
+        "key": file_store.object_key(task["user_id"], task["id"], file_id),
         "updated_at": time.time(),
     }
     file_store.put_file(file["key"], upload, file["type"])
     return file
 
 
-def stored_files(task_id, uploads):
-    return [stored_file(task_id, upload) for upload in uploads or []]
+def stored_files(task, uploads):
+    return [stored_file(task, upload) for upload in uploads or []]
 
 
 def file_data(file):
@@ -212,7 +212,7 @@ def attach_files_form(task):
     if not uploads:
         st.error("Choose at least one file.")
         return False
-    files = stored_files(task["id"], uploads)
+    files = stored_files(task, uploads)
     task_store.insert_files(task["id"], files)
     task_files(task).extend(files)
     reset_uploaders()
@@ -240,7 +240,7 @@ def file_details(task, file):
                 if name == file["name"]:
                     # Keep the folder, but take the new file's name along with its content.
                     name = name[: name.rfind("/") + 1] + upload.name
-                file.update(stored_file(task["id"], upload, file_id=fid))
+                file.update(stored_file(task, upload, file_id=fid))
                 reset_uploaders()
             if upload or name != file["name"]:
                 file["name"] = name
