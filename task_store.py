@@ -57,6 +57,8 @@ SCHEMA = [
         created_at timestamptz NOT NULL DEFAULT clock_timestamp()
     )
     """,
+    # Where the task sits on its board once it has been dragged; new tasks (NULL) go after the rest.
+    "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS position integer",
     "CREATE INDEX IF NOT EXISTS tasks_board_id ON tasks (board_id)",
     """
     CREATE TABLE IF NOT EXISTS task_files (
@@ -185,7 +187,8 @@ def _file(row):
 
 
 def load_tasks(user_id):
-    """The account's tasks in creation order, each with its files."""
+    """The account's tasks in board order (dragged ones first, then the rest in creation order), each
+    with its files."""
     files = {}
     for row in _rows(
         """
@@ -212,7 +215,7 @@ def load_tasks(user_id):
         for row in _rows(
             """
             SELECT t.* FROM tasks t JOIN boards b ON b.id = t.board_id
-            WHERE b.user_id = :user_id ORDER BY t.created_at, t.id
+            WHERE b.user_id = :user_id ORDER BY t.position NULLS LAST, t.created_at, t.id
             """,
             {"user_id": user_id},
         )
@@ -278,6 +281,21 @@ def update_task(task_id, fields):
         """,
         {"id": task_id, **_task_params(fields)},
     )
+
+
+def save_order(tasks):
+    """Store each task's board, group and position, as given by its index in `tasks`."""
+    if tasks:
+        _execute(
+            """
+            UPDATE tasks SET board_id = :board_id, group_name = :group_name, position = :position
+            WHERE id = :id
+            """,
+            [
+                {"id": t["id"], "board_id": t["board_id"], "group_name": t["group"], "position": i}
+                for i, t in enumerate(tasks)
+            ],
+        )
 
 
 def set_done(task_id, done_at):
