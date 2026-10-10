@@ -1,0 +1,23 @@
+# PostgreSQL for the task board. Values come from the environment or a .env file next to this one
+# (see .env.example); the app reads the same TASKBOARD_DB_* variables to connect.
+services:
+  db:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${TASKBOARD_DB_NAME:-taskboard}
+      POSTGRES_USER: ${TASKBOARD_DB_USER:-taskboard}
+      POSTGRES_PASSWORD: ${TASKBOARD_DB_PASSWORD:?Set TASKBOARD_DB_PASSWORD (see .env.example)}
+    ports:
+      # Only reachable from this machine.
+      - "127.0.0.1:${TASKBOARD_DB_PORT:-5432}:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  db-data:
