@@ -1,5 +1,6 @@
-# PostgreSQL for the task board. Values come from the environment or a .env file next to this one
-# (see .env.example); the app reads the same TASKBOARD_DB_* variables to connect.
+# PostgreSQL for the tasks and RustFS (S3-compatible storage) for their files. Values come from the
+# environment or a .env file next to this one (see .env.example); the app reads the same
+# TASKBOARD_DB_* and TASKBOARD_S3_* variables to connect.
 services:
   db:
     image: postgres:17
@@ -19,5 +20,27 @@ services:
       timeout: 3s
       retries: 10
 
+  rustfs:
+    image: rustfs/rustfs:1.0.1
+    restart: unless-stopped
+    environment:
+      RUSTFS_ACCESS_KEY: ${TASKBOARD_S3_ACCESS_KEY:-taskboard}
+      RUSTFS_SECRET_KEY: ${TASKBOARD_S3_SECRET_KEY:?Set TASKBOARD_S3_SECRET_KEY (see .env.example)}
+      RUSTFS_CONSOLE_ENABLE: "true"
+      # Log to stdout, so `docker compose logs` shows them.
+      RUSTFS_OBS_LOG_DIRECTORY: ""
+    ports:
+      # S3 API and web console, only reachable from this machine.
+      - "127.0.0.1:${TASKBOARD_S3_PORT:-9000}:9000"
+      - "127.0.0.1:${TASKBOARD_S3_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - rustfs-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   db-data:
+  rustfs-data:
