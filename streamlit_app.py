@@ -16,6 +16,7 @@ from db import connection_error, database_sidebar, db_configured
 from file_store import file_storage_sidebar, s3_configured
 from file_store import connection_error as file_storage_error
 from task_dblclick import task_dblclick_listener
+from task_dnd import task_drag_and_drop
 from task_files import (
     TREE_CSS,
     attach_files_button,
@@ -102,6 +103,121 @@ def board_groups(board_id):
         if group := task.get("group"):
             groups.setdefault(group.lower(), group)
     return sorted(groups.values(), key=str.lower)
+
+
+def group_key(task):
+    return task["group"].lower() if task.get("group") else None
+
+
+def group_dom_id(key):
+    # crc32 keeps the id stable and safe to use in a widget key.
+    return f"{zlib.crc32(key.encode()):08x}"
+
+
+def board_items(board_id):
+    """The board's tasks in order, as a list of (lowercased group name, tasks) items: an ungrouped task
+    is an item of its own (None, [task]), a group is one item placed where its first task is."""
+    items, groups = [], {}
+    for task in board_tasks(board_id):
+        if (key := group_key(task)) is None:
+            items.append((None, [task]))
+        elif key in groups:
+            groups[key].append(task)
+        else:
+            groups[key] = [task]
+            items.append((key, groups[key]))
+    return items
+
+
+def save_items(*boards):
+    """Store the order of each (board id, items) pair, giving each task that board and group."""
+    order = []
+    for board_id, items in boards:
+        for _, tasks in items:
+            for task in tasks:
+                task["board_id"] = board_id
+                order.append(task)
+    task_store.save_order(order)
+
+
+def find_item(items, ref):
+    """The index of the item a dropped {"kind": "task" or "group", "id": ...} refers to, else the end."""
+    for i, (key, tasks) in enumerate(items):
+        if ref and (
+            (ref["kind"] == "group" and key and group_dom_id(key) == ref["id"])
+            or (ref["kind"] == "task" and key is None and tasks and tasks[0]["id"] == ref["id"])
+        ):
+            return i
+    return len(items)
+
+
+def remove_task(items, task):
+    """Take the task out of its item. An emptied item stays as a placeholder; it stores nothing."""
+    for _, tasks in items:
+        if task in tasks:
+            tasks.remove(task)
+
+
+def move_task(task, group_id, before):
+    items = board_items(task["board_id"])
+    group = next((tasks for key, tasks in items if key and group_dom_id(key) == group_id), None)
+    remove_task(items, task)
+    if group is not None:
+        # Adopt the group's spelling, as groups are matched case-insensitively.
+        task["group"] = group[0]["group"] if group else task["group"]
+        index = next((i for i, t in enumerate(group) if before and t["id"] == before["id"]), len(group))
+        group.insert(index, task)
+    else:
+        task["group"] = None
+        items.insert(find_item(items, before), (None, [task]))
+    save_items((task["board_id"], items))
+
+
+def move_group(board_id, key, before):
+    items = board_items(board_id)
+    item = next(item for item in items if item[0] == key)
+    items.remove(item)
+    items.insert(find_item(items, before), item)
+    save_items((board_id, items))
+
+
+def move_to_board(tasks, board_id):
+    """Move the tasks to the end of their group on another board, or of that board if they have none."""
+    source_id = tasks[0]["board_id"]
+    source, target = board_items(source_id), board_items(board_id)
+    for task in tasks:
+        remove_task(source, task)
+        key = group_key(task)
+        if group := next((t for k, t in target if key and k == key), None):
+            group.append(task)
+        else:
+            target.append((key, [task]))
+    save_items((source_id, source), (board_id, target))
+
+
+def handle_drop(board_id, drop):
+    """Store where a task or group dragged on the board was dropped (see task_drag_and_drop)."""
+    if drop["board"] == board_id or (
+        drop["board"] and drop["board"] not in {b["id"] for b in st.session_state.boards}
+    ):
+        return
+    if drop["kind"] == "task":
+        task = find_task(drop["id"])
+        if not task or task["board_id"] != board_id:
+            return
+        if drop["board"]:
+            move_to_board([task], drop["board"])
+        else:
+            move_task(task, drop["group"], drop["before"])
+    elif drop["kind"] == "group":
+        items = board_items(board_id)
+        key = next((k for k, _ in items if k and group_dom_id(k) == drop["id"]), None)
+        if not key:
+            return
+        if drop["board"]:
+            move_to_board(next(tasks for k, tasks in items if k == key), drop["board"])
+        else:
+            move_group(board_id, key, drop["before"])
 
 
 def group_color(group):
@@ -353,26 +469,33 @@ def board_page(board_id):
     @st.fragment(run_every=1 if timers_running else None)
     def task_list():
         tasks = board_tasks(board_id)
-        visible = [t for t in tasks if (age := done_age(t)) is None or age < HIDE_AFTER]
-        # Completed tasks go to the top (most recent first), open tasks keep their creation order.
-        done = sorted((t for t in visible if t["done_at"] is not None), key=lambda t: -t["done_at"])
-        open_ = [t for t in visible if t["done_at"] is None]
+        # Ungrouped tasks and group boxes in board order (see board_items). Completed tasks go to the
+        # top of their group, or of the board when ungrouped (most recent first).
+        items = []
+        for key, item_tasks in board_items(board_id):
+            visible = [t for t in item_tasks if (age := done_age(t)) is None or age < HIDE_AFTER]
+            done = sorted((t for t in visible if t["done_at"] is not None), key=lambda t: -t["done_at"])
+            if visible:
+                items.append((key, done + [t for t in visible if t["done_at"] is None]))
+        done_ungrouped = sorted(
+            (tasks[0] for key, tasks in items if key is None and tasks[0]["done_at"] is not None),
+            key=lambda t: -t["done_at"],
+        )
 
-        if not visible:
+        if not items:
             st.info("No tasks yet. Click **Add task** to create one.", icon=":material/inbox:")
 
-        # Ungrouped tasks first, then one box per group in order of first appearance.
-        grouped = {}
-        for task in done + open_:
-            grouped.setdefault(task["group"].lower() if task.get("group") else None, []).append(task)
-
-        for task in grouped.pop(None, []):
+        for task in done_ungrouped:
             task_row(task)
-        for group_id, group_tasks in grouped.items():
+        for key, group_tasks in items:
+            if key is None:
+                if group_tasks[0]["done_at"] is None:
+                    task_row(group_tasks[0])
+                continue
             group = group_tasks[0]["group"]
             color = group_color(group)
-            # The color in the key lets the CSS tint the box; the crc keeps keys unique per group.
-            with st.container(border=True, key=f"group_{color}_{zlib.crc32(group_id.encode()):08x}"):
+            # The color in the key lets the CSS tint the box; the id keeps keys unique per group.
+            with st.container(border=True, key=f"group_{color}_{group_dom_id(key)}"):
                 icon = f':color[:material/folder:]{{foreground="rgb({GROUP_COLORS[color]})"}}'
                 st.markdown(f"{icon} **{group}** :small[:gray[{len(group_tasks)}]]")
                 for task in group_tasks:
@@ -402,6 +525,12 @@ def board_page(board_id):
 
     task_list()
     task_dblclick_listener(open_edit_dialog)
+    # Completed tasks are about to disappear, so only open ones can be dragged.
+    task_drag_and_drop(
+        board_id,
+        [t["id"] for t in board_tasks(board_id) if t["done_at"] is None],
+        partial(handle_drop, board_id),
+    )
 
 
 page_background = "#0e1117" if st.context.theme.type == "dark" else "#ffffff"
@@ -445,6 +574,14 @@ st.html(f"""
 /* Solid task rows so only the group box itself is tinted. */
 [class*="st-key-task_row_"] {{
     background-color: {page_background};
+}}
+/* Task rows and group boxes can be dragged (see task_dnd). */
+[class*="st-key-task_row_"],
+[class*="st-key-group_"] {{
+    cursor: grab;
+}}
+[class*="st-key-task_row_"] :is(button, input, label, [class*="st-key-file_tree_"]) {{
+    cursor: pointer;
 }}
 {"".join(
     f"""[class*="st-key-group_{name}_"] {{ background-color: rgba({rgb}, 0.1); border-color: rgba({rgb}, 0.4); }}\n"""
@@ -519,11 +656,13 @@ current_page = st.navigation(list(pages.values()), position="hidden")
 with st.sidebar:
     st.subheader("Boards")
     for board in st.session_state.boards:
-        st.page_link(
-            pages[board["id"]],
-            label=f"{board['name']} :small[:gray[{open_task_count(board['id'])}]]",
-            width="stretch",
-        )
+        # Keyed so tasks and groups can be dragged onto the board.
+        with st.container(key=f"board_link_{board['id']}"):
+            st.page_link(
+                pages[board["id"]],
+                label=f"{board['name']} :small[:gray[{open_task_count(board['id'])}]]",
+                width="stretch",
+            )
     if st.button("New board", icon=":material/add:", type="tertiary"):
         st.session_state.open_dialog = "new_board"
     # Pushes everything below to the bottom of the sidebar.
