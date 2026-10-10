@@ -9,7 +9,8 @@ import streamlit as st
 from dotenv import load_dotenv
 
 import task_store
-from auth_gate import account_sidebar, require_login
+from admin_panel import ADMIN_URL_PATH, admin_page
+from auth_gate import ACCOUNT_CSS, account_sidebar, require_login
 from board_icons import EMOJIS, emoji_label, random_emoji
 from db import connection_error, database_sidebar, db_configured
 from file_store import file_storage_sidebar, s3_configured
@@ -40,13 +41,13 @@ GROUP_COLORS = {
     "slate": "100, 116, 139",
 }
 TAG_COLORS = ["orange", "red", "yellow", "gray"]
-DEFAULT_BOARD_ID = task_store.DEFAULT_BOARD_ID
 DEFAULT_BOARD_ICON = task_store.DEFAULT_BOARD_ICON
 
 st.set_page_config(page_title="Task board", page_icon=":material/checklist:")
 
-# Boards, tasks and group colors are loaded from the database on every full run (see below), so
-# changes made in other sessions show up too. Changes are written through to the database.
+# The signed-in account and its boards, tasks and group colors are loaded from the database on every
+# full run (see below), so changes made in other sessions show up too. Changes are written through to
+# the database.
 # None, "add", "new_board", the id of the task being edited, ("attach", task id),
 # or ("file", task id, file id).
 st.session_state.setdefault("open_dialog", None)
@@ -57,7 +58,7 @@ def find_task(task_id):
 
 
 def board_tasks(board_id):
-    return [t for t in st.session_state.tasks if t.get("board_id", DEFAULT_BOARD_ID) == board_id]
+    return [t for t in st.session_state.tasks if t["board_id"] == board_id]
 
 
 def open_task_count(board_id):
@@ -109,7 +110,7 @@ def group_color(group):
     if colors.get(group.lower()) not in GROUP_COLORS:
         used = list(colors.values())
         colors[group.lower()] = min(GROUP_COLORS, key=used.count)
-        task_store.save_group_color(group.lower(), colors[group.lower()])
+        task_store.save_group_color(st.session_state.account["id"], group.lower(), colors[group.lower()])
     return colors[group.lower()]
 
 
@@ -131,7 +132,8 @@ def clean_tags(tags):
 
 def board_url_path(name):
     slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "board"
-    taken = {b["url_path"] for b in st.session_state.boards}
+    # The admin panel's path is taken for everyone, so no board can hide it.
+    taken = {b["url_path"] for b in st.session_state.boards} | {ADMIN_URL_PATH}
     candidate, n = slug, 2
     while candidate in taken:
         candidate, n = f"{slug}-{n}", n + 1
@@ -200,9 +202,15 @@ def task_form(board_id, task=None):
 @st.dialog("Add task", on_dismiss=close_dialog)
 def add_task_dialog(board_id):
     if fields := task_form(board_id):
-        task_id = uuid.uuid4().hex
-        files = stored_files(task_id, fields.pop("uploads"))
-        task = {"id": task_id, "board_id": board_id, **fields, "files": files, "done_at": None}
+        uploads = fields.pop("uploads")
+        task = {
+            "id": uuid.uuid4().hex,
+            "user_id": st.session_state.account["id"],
+            "board_id": board_id,
+            **fields,
+            "done_at": None,
+        }
+        task["files"] = stored_files(task, uploads)
         task_store.insert_task(task)
         st.session_state.tasks.append(task)
         close_dialog()
@@ -211,7 +219,7 @@ def add_task_dialog(board_id):
 
 @st.dialog("Edit task", on_dismiss=close_dialog)
 def edit_task_dialog(task):
-    if fields := task_form(task.get("board_id", DEFAULT_BOARD_ID), task):
+    if fields := task_form(task["board_id"], task):
         task_store.update_task(task["id"], fields)
         task.update(fields)
         close_dialog()
@@ -263,7 +271,7 @@ def new_board_dialog():
         "icon": icon or random_emoji(),
         "url_path": board_url_path(name),
     }
-    task_store.insert_board(board)
+    task_store.insert_board(st.session_state.account["id"], board)
     st.session_state.boards.append(board)
     # The new board's page only exists from the next run on, so switch to it there.
     st.session_state.switch_to_board = board["id"]
@@ -324,7 +332,7 @@ def board_page(board_id):
     if dialog == "add":
         add_task_dialog(board_id)
     elif dialog == "new_board":
-        new_board_dialog()
+        pass  # Opened below the sidebar, so it works on every page.
     elif isinstance(dialog, tuple):
         task = find_task(dialog[1])
         if dialog[0] == "attach" and task:
@@ -412,6 +420,28 @@ st.html(f"""
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
 }}
 {TREE_CSS}
+{ACCOUNT_CSS}
+/* The sidebar's content fills its height, so st.space("stretch") can push the account section to
+   the bottom. */
+[data-testid="stSidebarContent"],
+[data-testid="stSidebarUserContent"],
+[data-testid="stSidebarUserContent"] > div {{
+    display: flex;
+    flex-direction: column;
+}}
+[data-testid="stSidebarUserContent"],
+[data-testid="stSidebarUserContent"] > div {{
+    flex: 1 0 auto;
+}}
+/* Streamlit's default bottom padding would lift the account section well off the bottom. */
+[data-testid="stSidebarUserContent"] {{
+    padding-bottom: 1.5rem;
+}}
+/* Page links pad their content by 0.5rem, leaving room for the current page's highlight. Everything
+   else in the sidebar except dividers is indented to match, so it all lines up. */
+[data-testid="stSidebarUserContent"] [data-testid="stElementContainer"]:not(:has([data-testid^="stPageLink"], hr)) {{
+    padding-left: 0.5rem;
+}}
 /* Solid task rows so only the group box itself is tinted. */
 [class*="st-key-task_row_"] {{
     background-color: {page_background};
@@ -422,6 +452,7 @@ st.html(f"""
 )}
 </style>
 """)
+
 
 def storage_problems():
     """Why tasks or their files can't be stored right now; empty when everything is ready."""
@@ -441,13 +472,13 @@ def storage_problems():
 
 
 problems = storage_problems()
-# The board list is needed before login, so the login page is served at each board's URL.
-boards = [] if problems else task_store.load_boards()
-auth_mode = require_login([b["url_path"] for b in boards if b["id"] != DEFAULT_BOARD_ID])
+# The login page is served at every board's URL (and the admin panel's), so opening a link to one
+# while logged out shows the login form and stays on that page afterwards.
+account = require_login([] if problems else [*task_store.board_url_paths(), ADMIN_URL_PATH])
 
 if problems:
     with st.sidebar:
-        account_sidebar(auth_mode)
+        account_sidebar(account)
     for problem in problems:
         st.error(problem, icon=":material/error:")
     if st.button("Try again", icon=":material/refresh:"):
@@ -456,9 +487,13 @@ if problems:
         st.rerun()
     st.stop()
 
-st.session_state.boards = boards
-st.session_state.tasks = task_store.load_tasks()
-st.session_state.group_colors = task_store.load_group_colors()  # lowercased group name -> color
+# Also recreates the account if an administrator deleted it while this session was open.
+account["id"] = task_store.ensure_account(account["identity"], account["name"], account["email"])
+st.session_state.account = account
+st.session_state.boards = task_store.load_boards(account["id"])
+st.session_state.tasks = task_store.load_tasks(account["id"])
+# Lowercased group name -> color.
+st.session_state.group_colors = task_store.load_group_colors(account["id"])
 
 # One page per board. The built-in menu is hidden (it disappears entirely with a single page),
 # so the sidebar below renders the board list itself.
@@ -468,10 +503,17 @@ pages = {
         title=board["name"],
         icon=board.get("icon", DEFAULT_BOARD_ICON),
         url_path=board["url_path"],
-        default=board["id"] == DEFAULT_BOARD_ID,
+        default=board["is_default"],
     )
     for board in st.session_state.boards
 }
+if account["is_admin"]:
+    pages["admin"] = st.Page(
+        partial(admin_page, account),
+        title="Admin panel",
+        icon=":material/admin_panel_settings:",
+        url_path=ADMIN_URL_PATH,
+    )
 current_page = st.navigation(list(pages.values()), position="hidden")
 
 with st.sidebar:
@@ -482,13 +524,18 @@ with st.sidebar:
             label=f"{board['name']} :small[:gray[{open_task_count(board['id'])}]]",
             width="stretch",
         )
-    # Runs before the page, so the board page opens the dialog in this same run.
     if st.button("New board", icon=":material/add:", type="tertiary"):
         st.session_state.open_dialog = "new_board"
-    st.divider()
-    account_sidebar(auth_mode)
+    # Pushes everything below to the bottom of the sidebar.
+    st.space("stretch")
     database_sidebar()
     file_storage_sidebar()
+    st.divider()
+    account_sidebar(account, pages.get("admin"))
+
+# Opened here rather than on the board page, so it also works on the admin panel.
+if st.session_state.open_dialog == "new_board":
+    new_board_dialog()
 
 if switch_to := st.session_state.pop("switch_to_board", None):
     st.switch_page(pages[switch_to])
