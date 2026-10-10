@@ -8,9 +8,12 @@ from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
 
+import task_store
 from auth_gate import account_sidebar, require_login
 from board_icons import EMOJIS, emoji_label, random_emoji
-from db import database_sidebar
+from db import connection_error, database_sidebar, db_configured
+from file_store import file_storage_sidebar, s3_configured
+from file_store import connection_error as file_storage_error
 from task_dblclick import task_dblclick_listener
 from task_files import (
     TREE_CSS,
@@ -37,17 +40,13 @@ GROUP_COLORS = {
     "slate": "100, 116, 139",
 }
 TAG_COLORS = ["orange", "red", "yellow", "gray"]
-DEFAULT_BOARD_ID = "default"
-DEFAULT_BOARD_ICON = "📋"
+DEFAULT_BOARD_ID = task_store.DEFAULT_BOARD_ID
+DEFAULT_BOARD_ICON = task_store.DEFAULT_BOARD_ICON
 
 st.set_page_config(page_title="Task board", page_icon=":material/checklist:")
 
-st.session_state.setdefault("tasks", [])
-st.session_state.setdefault(
-    "boards",
-    [{"id": DEFAULT_BOARD_ID, "name": "Default", "icon": DEFAULT_BOARD_ICON, "url_path": "default"}],
-)
-st.session_state.setdefault("group_colors", {})  # lowercased group name -> color
+# Boards, tasks and group colors are loaded from the database on every full run (see below), so
+# changes made in other sessions show up too. Changes are written through to the database.
 # None, "add", "new_board", the id of the task being edited, ("attach", task id),
 # or ("file", task id, file id).
 st.session_state.setdefault("open_dialog", None)
@@ -78,10 +77,12 @@ def has_timers(board_id):
 
 def toggle_done(task):
     task["done_at"] = time.time() if st.session_state[f"done_{task['id']}"] else None
+    task_store.set_done(task["id"], task["done_at"])
 
 
 def undo_done(task):
     task["done_at"] = None
+    task_store.set_done(task["id"], None)
     st.session_state.pop(f"done_{task['id']}", None)
 
 
@@ -108,6 +109,7 @@ def group_color(group):
     if colors.get(group.lower()) not in GROUP_COLORS:
         used = list(colors.values())
         colors[group.lower()] = min(GROUP_COLORS, key=used.count)
+        task_store.save_group_color(group.lower(), colors[group.lower()])
     return colors[group.lower()]
 
 
@@ -190,7 +192,7 @@ def task_form(board_id, task=None):
         "due_date": due_date,
     }
     if not task:
-        fields["files"] = stored_files(uploads)
+        fields["uploads"] = uploads
     return fields
 
 
@@ -198,9 +200,11 @@ def task_form(board_id, task=None):
 @st.dialog("Add task", on_dismiss=close_dialog)
 def add_task_dialog(board_id):
     if fields := task_form(board_id):
-        st.session_state.tasks.append(
-            {"id": uuid.uuid4().hex, "board_id": board_id, **fields, "done_at": None}
-        )
+        task_id = uuid.uuid4().hex
+        files = stored_files(task_id, fields.pop("uploads"))
+        task = {"id": task_id, "board_id": board_id, **fields, "files": files, "done_at": None}
+        task_store.insert_task(task)
+        st.session_state.tasks.append(task)
         close_dialog()
         st.rerun()
 
@@ -208,6 +212,7 @@ def add_task_dialog(board_id):
 @st.dialog("Edit task", on_dismiss=close_dialog)
 def edit_task_dialog(task):
     if fields := task_form(task.get("board_id", DEFAULT_BOARD_ID), task):
+        task_store.update_task(task["id"], fields)
         task.update(fields)
         close_dialog()
         st.rerun()
@@ -258,6 +263,7 @@ def new_board_dialog():
         "icon": icon or random_emoji(),
         "url_path": board_url_path(name),
     }
+    task_store.insert_board(board)
     st.session_state.boards.append(board)
     # The new board's page only exists from the next run on, so switch to it there.
     st.session_state.switch_to_board = board["id"]
@@ -417,9 +423,42 @@ st.html(f"""
 </style>
 """)
 
-auth_mode = require_login(
-    [b["url_path"] for b in st.session_state.boards if b["id"] != DEFAULT_BOARD_ID]
-)
+def storage_problems():
+    """Why tasks or their files can't be stored right now; empty when everything is ready."""
+    problems = []
+    if not db_configured():
+        problems.append(
+            "No database is configured. Set `TASKBOARD_DB_HOST` or `TASKBOARD_DATABASE_URL` "
+            "(see `.env.example`)."
+        )
+    elif error := connection_error():
+        problems.append(f"The database can't be reached: `{error}`")
+    if not s3_configured():
+        problems.append("No file storage is configured. Set `TASKBOARD_S3_BUCKET` (see `.env.example`).")
+    elif error := file_storage_error():
+        problems.append(f"File storage can't be reached: `{error}`")
+    return problems
+
+
+problems = storage_problems()
+# The board list is needed before login, so the login page is served at each board's URL.
+boards = [] if problems else task_store.load_boards()
+auth_mode = require_login([b["url_path"] for b in boards if b["id"] != DEFAULT_BOARD_ID])
+
+if problems:
+    with st.sidebar:
+        account_sidebar(auth_mode)
+    for problem in problems:
+        st.error(problem, icon=":material/error:")
+    if st.button("Try again", icon=":material/refresh:"):
+        connection_error.clear()
+        file_storage_error.clear()
+        st.rerun()
+    st.stop()
+
+st.session_state.boards = boards
+st.session_state.tasks = task_store.load_tasks()
+st.session_state.group_colors = task_store.load_group_colors()  # lowercased group name -> color
 
 # One page per board. The built-in menu is hidden (it disappears entirely with a single page),
 # so the sidebar below renders the board list itself.
@@ -449,6 +488,7 @@ with st.sidebar:
     st.divider()
     account_sidebar(auth_mode)
     database_sidebar()
+    file_storage_sidebar()
 
 if switch_to := st.session_state.pop("switch_to_board", None):
     st.switch_page(pages[switch_to])
