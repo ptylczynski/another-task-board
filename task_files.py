@@ -1,7 +1,8 @@
 """Files attached to tasks: add, preview, download, rename, replace and delete.
 
-Each task keeps its attachments in `task["files"]`, a list of dicts holding the file's bytes, so they
-live in session state alongside the tasks themselves.
+Each task keeps its attachments in `task["files"]`, a list of dicts describing each file. Their
+contents are stored in S3 under the file's "key" (see file_store) and the rest in the database (see
+task_store).
 """
 
 import io
@@ -12,6 +13,9 @@ from datetime import datetime
 
 import streamlit as st
 from PIL import Image
+
+import file_store
+import task_store
 
 PREVIEW_CHARS = 20_000  # text previews are cut off after this many characters
 # The tree's connecting lines are drawn with borders rather than "│├└" characters: glyphs don't
@@ -68,19 +72,30 @@ def find_file(task, file_id):
     return next((f for f in task_files(task) if f["id"] == file_id), None)
 
 
-def stored_file(upload):
-    return {
-        "id": uuid.uuid4().hex,
+def stored_file(task_id, upload, file_id=None):
+    """Upload the file's contents to S3 and return its description, which isn't saved yet.
+
+    Passing the id of an existing file replaces its contents.
+    """
+    file_id = file_id or uuid.uuid4().hex
+    file = {
+        "id": file_id,
         "name": upload.name,
         "type": upload.type or "application/octet-stream",
         "size": upload.size,
-        "data": upload.getvalue(),
+        "key": file_store.object_key(task_id, file_id),
         "updated_at": time.time(),
     }
+    file_store.put_file(file["key"], upload, file["type"])
+    return file
 
 
-def stored_files(uploads):
-    return [stored_file(upload) for upload in uploads or []]
+def stored_files(task_id, uploads):
+    return [stored_file(task_id, upload) for upload in uploads or []]
+
+
+def file_data(file):
+    return file_store.read_file(file["key"], file["updated_at"])
 
 
 def uploader_key(name):
@@ -160,22 +175,23 @@ def tree_lines(files):
 
 
 def file_preview(file):
+    if not (file["type"].startswith("image/") or is_text(file)):
+        st.caption("No preview for this type of file.")
+        return
+    data = file_data(file)
     if file["type"] == "image/svg+xml":
-        st.image(file["data"].decode("utf-8", errors="replace"))
+        st.image(data.decode("utf-8", errors="replace"))
         return
     if file["type"].startswith("image/"):
         # Checked up front: some formats go to the browser as-is and would just show nothing.
         try:
-            Image.open(io.BytesIO(file["data"])).verify()
+            Image.open(io.BytesIO(data)).verify()
         except Exception:  # noqa: BLE001 - a corrupt or mislabelled upload shouldn't break the board
             st.caption(":material/broken_image: This image can't be shown; download it instead.")
         else:
-            st.image(file["data"])
+            st.image(data)
         return
-    if not is_text(file):
-        st.caption("No preview for this type of file.")
-        return
-    text = file["data"][:PREVIEW_CHARS].decode("utf-8", errors="replace")
+    text = data[:PREVIEW_CHARS].decode("utf-8", errors="replace")
     st.code(text, language=None, wrap_lines=True, height=min(400, 40 + 22 * text.count("\n")))
     if file["size"] > PREVIEW_CHARS:
         st.caption("Preview cut off; download the file to see all of it.")
@@ -196,7 +212,9 @@ def attach_files_form(task):
     if not uploads:
         st.error("Choose at least one file.")
         return False
-    task_files(task).extend(stored_files(uploads))
+    files = stored_files(task["id"], uploads)
+    task_store.insert_files(task["id"], files)
+    task_files(task).extend(files)
     reset_uploaders()
     return True
 
@@ -222,11 +240,12 @@ def file_details(task, file):
                 if name == file["name"]:
                     # Keep the folder, but take the new file's name along with its content.
                     name = name[: name.rfind("/") + 1] + upload.name
-                file.update({k: v for k, v in stored_file(upload).items() if k != "id"})
+                file.update(stored_file(task["id"], upload, file_id=fid))
                 reset_uploaders()
             if upload or name != file["name"]:
                 file["name"] = name
                 file["updated_at"] = time.time()
+                task_store.update_file(file)
                 # A full rerun, so the task card behind the dialog shows the change too.
                 st.rerun()
 
@@ -235,7 +254,7 @@ def file_details(task, file):
         st.download_button(
             "Download",
             # A callable defers sending the bytes until the button is clicked.
-            data=lambda: file["data"],
+            data=lambda: file_data(file),
             file_name=file["name"].rsplit("/", 1)[-1],
             mime=file["type"],
             on_click="ignore",
@@ -253,6 +272,8 @@ def file_details(task, file):
         st.markdown("Delete this file?")
         st.button("Cancel", on_click=_set_confirm_delete, args=(confirm_key, False))
         if st.button("Delete", icon=":material/delete:", type="primary", key=f"file_delete_{fid}"):
+            task_store.delete_file(fid)
+            file_store.delete_file(file["key"])
             task["files"] = [f for f in task_files(task) if f["id"] != fid]
             del st.session_state[confirm_key]
             return True
