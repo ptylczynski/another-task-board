@@ -12,6 +12,14 @@ from auth_gate import account_sidebar, require_login
 from board_icons import EMOJIS, emoji_label, random_emoji
 from db import database_sidebar
 from task_dblclick import task_dblclick_listener
+from task_files import (
+    attach_files_button,
+    attach_files_form,
+    file_details,
+    files_tree,
+    find_file,
+    stored_files,
+)
 
 # Variables already set in the environment take precedence over .env.
 load_dotenv(Path(__file__).with_name(".env"))
@@ -39,8 +47,13 @@ st.session_state.setdefault(
     [{"id": DEFAULT_BOARD_ID, "name": "Default", "icon": DEFAULT_BOARD_ICON, "url_path": "default"}],
 )
 st.session_state.setdefault("group_colors", {})  # lowercased group name -> color
-# None, "add", "new_board", or the id of the task being edited.
+# None, "add", "new_board", the id of the task being edited, ("attach", task id),
+# or ("file", task id, file id).
 st.session_state.setdefault("open_dialog", None)
+
+
+def find_task(task_id):
+    return next((t for t in st.session_state.tasks if t["id"] == task_id), None)
 
 
 def board_tasks(board_id):
@@ -154,6 +167,8 @@ def task_form(board_id, task=None):
         due_date = st.date_input(
             "Due date (optional)", value=task["due_date"] if task else None, format="YYYY-MM-DD"
         )
+        # Existing tasks manage their files from the task card instead.
+        uploads = None if task else st.file_uploader("Files (optional)", accept_multiple_files=True)
         submitted = st.form_submit_button(
             "Save" if task else "Add",
             icon=":material/check:" if task else ":material/add:",
@@ -166,13 +181,16 @@ def task_form(board_id, task=None):
     if not name:
         st.error("Task name is required.")
         return None
-    return {
+    fields = {
         "name": name,
         "description": description.strip(),
         "tags": clean_tags(tags),
         "group": (group or "").strip() or None,
         "due_date": due_date,
     }
+    if not task:
+        fields["files"] = stored_files(uploads)
+    return fields
 
 
 # Dialogs are opened via session state so they survive full reruns triggered by the task timer.
@@ -190,6 +208,21 @@ def add_task_dialog(board_id):
 def edit_task_dialog(task):
     if fields := task_form(task.get("board_id", DEFAULT_BOARD_ID), task):
         task.update(fields)
+        close_dialog()
+        st.rerun()
+
+
+@st.dialog("Attach files", on_dismiss=close_dialog)
+def attach_files_dialog(task):
+    st.caption(task["name"])
+    if attach_files_form(task):
+        close_dialog()
+        st.rerun()
+
+
+@st.dialog("Attachment", width="medium", on_dismiss=close_dialog)
+def file_dialog(task, file):
+    if file_details(task, file):
         close_dialog()
         st.rerun()
 
@@ -232,7 +265,7 @@ def new_board_dialog():
 
 
 def open_edit_dialog(task_id):
-    if any(t["id"] == task_id for t in st.session_state.tasks):
+    if find_task(task_id):
         st.session_state.open_dialog = task_id
 
 
@@ -258,8 +291,14 @@ def task_row(task):
                     st.caption(task["description"])
                 if task.get("tags"):
                     st.markdown(" ".join(tag_badge(tag) for tag in task["tags"]))
+                if file_id := files_tree(task):
+                    st.session_state.open_dialog = ("file", task["id"], file_id)
+                    st.rerun()
         if task["due_date"]:
             st.caption(f":material/event: {task['due_date']:%Y-%m-%d}", width="content")
+        if attach_files_button(task):
+            st.session_state.open_dialog = ("attach", task["id"])
+            st.rerun()
         if st.button(":material/edit:", key=f"edit_{task['id']}", help="Edit task", type="tertiary"):
             st.session_state.open_dialog = task["id"]
             st.rerun()
@@ -279,9 +318,16 @@ def board_page(board_id):
         add_task_dialog(board_id)
     elif dialog == "new_board":
         new_board_dialog()
+    elif isinstance(dialog, tuple):
+        task = find_task(dialog[1])
+        if dialog[0] == "attach" and task:
+            attach_files_dialog(task)
+        elif dialog[0] == "file" and task and (file := find_file(task, dialog[2])):
+            file_dialog(task, file)
+        else:
+            close_dialog()
     elif dialog:
-        edited = next((t for t in st.session_state.tasks if t["id"] == dialog), None)
-        if edited:
+        if edited := find_task(dialog):
             edit_task_dialog(edited)
         else:
             close_dialog()
@@ -357,6 +403,14 @@ st.html(f"""
 [class*="st-key-undo_toast_"] {{
     background-color: {page_background};
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+}}
+/* File names in the tree are buttons; keep them as compact as the caption text around them. */
+[class*="st-key-file_open_"] button {{
+    min-height: 0;
+    height: 1.5rem;
+}}
+[class*="st-key-file_open_"] button p {{
+    font-size: 0.875rem;
 }}
 /* Solid task rows so only the group box itself is tinted. */
 [class*="st-key-task_row_"] {{
