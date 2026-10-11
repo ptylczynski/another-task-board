@@ -3,6 +3,23 @@
 A task board built with [Streamlit](https://streamlit.io). Each person gets their own boards of tasks,
 backed by PostgreSQL, with file attachments stored in S3-compatible storage.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/board-dark.png">
+  <img alt="A board with tasks, tags, due dates, attached files and two colored groups" src="docs/screenshots/board-light.png">
+</picture>
+
+## Screenshots
+
+| Editing a task | Previewing an attachment |
+| --- | --- |
+| ![The edit dialog with a task's name, description, tags, group and due date](docs/screenshots/edit-task.png) | ![An attachment dialog showing an image preview with rename, replace, download and delete](docs/screenshots/file-preview.png) |
+
+| Admin panel |
+| --- |
+| ![The admin panel listing every account with its boards, tasks, files and storage used](docs/screenshots/admin-panel.png) |
+
+The app follows your system's light or dark theme.
+
 ## Features
 
 - **Boards**: as many as you like, each with a name and an emoji icon, listed in the sidebar.
