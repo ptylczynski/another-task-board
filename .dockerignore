@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+.ruff_cache/
+.idea/
+.git/
+.github/
+.agents/
+.claude/
+.streamlit/secrets.toml
