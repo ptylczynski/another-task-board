@@ -1,7 +1,43 @@
-# PostgreSQL for the tasks and RustFS (S3-compatible storage) for their files. Values come from the
-# environment or a .env file next to this one (see .env.example); the app reads the same
-# TASKBOARD_DB_* and TASKBOARD_S3_* variables to connect.
+# The task board with PostgreSQL for the tasks and RustFS (S3-compatible storage) for their files.
+# Values come from the environment or a .env file next to this one (see .env.example). To run only
+# the database and storage, e.g. for the app started with `streamlit run`: `docker compose up -d db rustfs`.
 services:
+  app:
+    image: ghcr.io/ptylczynski/another-task-board:latest
+    # `docker compose up --build` builds the image from this checkout instead of pulling it.
+    build: .
+    restart: unless-stopped
+    environment:
+      # The other services, by their names on the compose network.
+      TASKBOARD_DB_HOST: db
+      TASKBOARD_DB_PORT: 5432
+      TASKBOARD_DB_NAME: ${TASKBOARD_DB_NAME:-taskboard}
+      TASKBOARD_DB_USER: ${TASKBOARD_DB_USER:-taskboard}
+      TASKBOARD_DB_PASSWORD: ${TASKBOARD_DB_PASSWORD}
+      TASKBOARD_S3_ENDPOINT_URL: http://rustfs:9000
+      TASKBOARD_S3_BUCKET: ${TASKBOARD_S3_BUCKET:-taskboard}
+      TASKBOARD_S3_ACCESS_KEY: ${TASKBOARD_S3_ACCESS_KEY:-taskboard}
+      TASKBOARD_S3_SECRET_KEY: ${TASKBOARD_S3_SECRET_KEY}
+      TASKBOARD_S3_REGION: ${TASKBOARD_S3_REGION:-}
+      # Unset ones are passed as empty, which the app treats as unset.
+      TASKBOARD_LOGIN: ${TASKBOARD_LOGIN:-}
+      TASKBOARD_PASSWORD: ${TASKBOARD_PASSWORD:-}
+      TASKBOARD_OIDC_CLIENT_ID: ${TASKBOARD_OIDC_CLIENT_ID:-}
+      TASKBOARD_OIDC_CLIENT_SECRET: ${TASKBOARD_OIDC_CLIENT_SECRET:-}
+      TASKBOARD_OIDC_SERVER_METADATA_URL: ${TASKBOARD_OIDC_SERVER_METADATA_URL:-}
+      TASKBOARD_OIDC_REDIRECT_URI: ${TASKBOARD_OIDC_REDIRECT_URI:-}
+      TASKBOARD_OIDC_COOKIE_SECRET: ${TASKBOARD_OIDC_COOKIE_SECRET:-}
+      TASKBOARD_AUTH_DISABLED: ${TASKBOARD_AUTH_DISABLED:-}
+    ports:
+      # Only reachable from this machine; put a reverse proxy in front to serve it to others.
+      - "127.0.0.1:${TASKBOARD_PORT:-8501}:8501"
+    depends_on:
+      db:
+        condition: service_healthy
+      rustfs:
+        condition: service_healthy
+
+
   db:
     image: postgres:17
     restart: unless-stopped
