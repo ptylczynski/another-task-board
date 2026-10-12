@@ -280,10 +280,11 @@ def tag_badge(tag):
     return f":{color}-badge[{tag}]"
 
 
-# The open_dialog values that refer to a board or a group rather than a task: ("board", board id) and
-# ("group", board id, lowercased group name).
+# The open_dialog values that refer to a board or a group rather than a task: ("board", board id),
+# ("group", board id, lowercased group name) and ("add_to_group", board id, lowercased group name).
 BOARD_DIALOG = "board"
 GROUP_DIALOG = "group"
+ADD_TO_GROUP_DIALOG = "add_to_group"
 
 
 def board_url_path(name, board_id=None):
@@ -358,8 +359,11 @@ def close_dialog():
     st.session_state.pop("new_access_token", None)
 
 
-def task_form(board_id, task=None):
-    """Render the task fields; return them once submitted and valid, else None."""
+def task_form(board_id, task=None, new_group_key=None):
+    """Render the task fields; return them once submitted and valid, else None.
+
+    For a new task, pass a lowercased group name to preselect that group.
+    """
     with st.form(f"task_form_{task['id'] if task else 'new'}", border=False):
         name = st.text_input(
             "Name", value=task["name"] if task else "", placeholder="What needs to be done?"
@@ -375,7 +379,7 @@ def task_form(board_id, task=None):
             placeholder="Choose or type a new tag",
         )
         groups = sorted((g["name"] for g in board_groups(board_id)), key=str.lower)
-        current_key = group_key(task) if task else None
+        current_key = group_key(task) if task else new_group_key
         group = st.selectbox(
             "Group (optional)",
             options=[None, *groups],
@@ -416,8 +420,8 @@ def task_form(board_id, task=None):
 
 # Dialogs are opened via session state so they survive full reruns triggered by the task timer.
 @st.dialog("Add task", on_dismiss=close_dialog)
-def add_task_dialog(board_id):
-    if fields := task_form(board_id):
+def add_task_dialog(board_id, new_group_key=None):
+    if fields := task_form(board_id, new_group_key=new_group_key):
         uploads = fields.pop("uploads")
         task = {
             "id": uuid.uuid4().hex,
@@ -726,6 +730,11 @@ def board_page(board_id):
             edit_group_dialog(group)
         else:
             close_dialog()
+    elif isinstance(dialog, tuple) and dialog[0] == ADD_TO_GROUP_DIALOG:
+        if dialog[1] == board_id and find_group(board_id, dialog[2]):
+            add_task_dialog(board_id, dialog[2])
+        else:
+            close_dialog()
     elif isinstance(dialog, tuple):
         task = find_task(dialog[1])
         if dialog[0] == "attach" and task:
@@ -778,6 +787,14 @@ def board_page(board_id):
                     icon = f':color[:material/folder:]{{foreground="rgb({GROUP_COLORS[color]})"}}'
                     st.markdown(f"{icon} **{group['name']}** :small[:gray[{len(group_tasks)}]]")
                     st.space("stretch")
+                    if st.button(
+                        ":material/add:",
+                        key=f"add_to_group_{dom_id}",
+                        help="Add a task to this group",
+                        type="tertiary",
+                    ):
+                        st.session_state.open_dialog = (ADD_TO_GROUP_DIALOG, board_id, group["key"])
+                        st.rerun()
                     if st.button(
                         ":material/edit:",
                         key=f"edit_group_{dom_id}",
