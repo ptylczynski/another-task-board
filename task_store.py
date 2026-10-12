@@ -6,8 +6,12 @@ account deletes everything it owns. A task names its group; the group itself is 
 it stays on the board when it has no tasks. Rows are returned as the dicts the app works with: times as
 epoch seconds (like time.time()), due dates as datetime.date, and each task's attachments under
 "files". The tables are created on first use.
+
+An account can also have access tokens for the MCP server (see mcp_server); only their SHA-256 hashes
+are stored.
 """
 
+import hashlib
 import uuid
 from datetime import UTC, datetime
 
@@ -102,6 +106,17 @@ SCHEMA = [
         PRIMARY KEY (user_id, group_key)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS access_tokens (
+        id text PRIMARY KEY,
+        user_id text NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+        name text NOT NULL,
+        token_hash text NOT NULL UNIQUE,
+        created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+        last_used_at timestamptz
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS access_tokens_user_id ON access_tokens (user_id)",
 ]
 
 
@@ -478,6 +493,74 @@ def save_group_color(user_id, group_key, color):
         """,
         {"user_id": user_id, "group_key": group_key, "color": color},
     )
+
+
+def clean_tags(tags):
+    """The tags without blanks, case-insensitive duplicates or brackets (which would break the badge
+    Markdown)."""
+    cleaned = {}
+    for tag in tags:
+        tag = tag.replace("[", "").replace("]", "").strip()
+        if tag:
+            cleaned.setdefault(tag.lower(), tag)
+    return list(cleaned.values())
+
+
+def _token_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def insert_access_token(user_id, name, token):
+    """Store the token for the account; returns its id."""
+    token_id = uuid.uuid4().hex
+    _execute(
+        """
+        INSERT INTO access_tokens (id, user_id, name, token_hash)
+        VALUES (:id, :user_id, :name, :token_hash)
+        """,
+        {"id": token_id, "user_id": user_id, "name": name, "token_hash": _token_hash(token)},
+    )
+    return token_id
+
+
+def load_access_tokens(user_id):
+    return [
+        {
+            **row,
+            "created_at": _to_seconds(row["created_at"]),
+            "last_used_at": _to_seconds(row["last_used_at"]),
+        }
+        for row in _rows(
+            """
+            SELECT id, name, created_at, last_used_at FROM access_tokens
+            WHERE user_id = :user_id ORDER BY created_at, id
+            """,
+            {"user_id": user_id},
+        )
+    ]
+
+
+def delete_access_token(user_id, token_id):
+    _execute(
+        "DELETE FROM access_tokens WHERE id = :id AND user_id = :user_id",
+        {"id": token_id, "user_id": user_id},
+    )
+
+
+def use_access_token(token):
+    """The (token id, account id) the token belongs to, or None; records that it was used."""
+    ensure_schema()
+    with connection().engine.begin() as conn:
+        row = conn.execute(
+            sa.text(
+                """
+                UPDATE access_tokens SET last_used_at = clock_timestamp()
+                WHERE token_hash = :token_hash RETURNING id, user_id
+                """
+            ),
+            {"token_hash": _token_hash(token)},
+        ).first()
+    return (row.id, row.user_id) if row else None
 
 
 def load_accounts():
