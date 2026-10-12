@@ -50,8 +50,8 @@ st.set_page_config(page_title="Task board", page_icon=":material/checklist:")
 # The signed-in account and its boards, tasks and group colors are loaded from the database on every
 # full run (see below), so changes made in other sessions show up too. Changes are written through to
 # the database.
-# None, "add", "new_board", the id of the task being edited, ("board", board id), ("attach", task id),
-# or ("file", task id, file id).
+# None, "add", "new_board", the id of the task being edited, ("board", board id),
+# ("group", board id, group key), ("attach", task id), or ("file", task id, file id).
 st.session_state.setdefault("open_dialog", None)
 
 
@@ -99,11 +99,12 @@ def all_tags():
 
 
 def board_groups(board_id):
-    groups = {}
-    for task in board_tasks(board_id):
-        if group := task.get("group"):
-            groups.setdefault(group.lower(), group)
-    return sorted(groups.values(), key=str.lower)
+    """The board's stored groups, including the ones without tasks."""
+    return [g for g in st.session_state.groups if g["board_id"] == board_id]
+
+
+def find_group(board_id, key):
+    return next((g for g in board_groups(board_id) if g["key"] == key), None)
 
 
 def group_key(task):
@@ -115,45 +116,81 @@ def group_dom_id(key):
     return f"{zlib.crc32(key.encode()):08x}"
 
 
+def item_position(item):
+    group, tasks = item
+    return tasks[0]["position"] if tasks else group["position"]
+
+
 def board_items(board_id):
-    """The board's tasks in order, as a list of (lowercased group name, tasks) items: an ungrouped task
-    is an item of its own (None, [task]), a group is one item placed where its first task is."""
-    items, groups = [], {}
+    """The board's tasks and groups in order, as a list of (group, tasks) items: an ungrouped task is an
+    item of its own (None, [task]), a group is one item placed where its first task is, or where it was
+    last stored when it has no tasks."""
+    groups = {g["key"]: g for g in board_groups(board_id)}
+    items, grouped = [], {}
     for task in board_tasks(board_id):
         if (key := group_key(task)) is None:
             items.append((None, [task]))
-        elif key in groups:
-            groups[key].append(task)
+        elif key in grouped:
+            grouped[key].append(task)
         else:
-            groups[key] = [task]
-            items.append((key, groups[key]))
+            grouped[key] = [task]
+            # A group added by another session may not be loaded yet.
+            group = groups.get(key) or {
+                "board_id": board_id, "key": key, "name": task["group"], "position": None
+            }
+            items.append((group, grouped[key]))
+    # Positions are unique on a board (see save_items), so each empty group goes back where it was.
+    empty = [g for key, g in groups.items() if key not in grouped]
+    for group in sorted(empty, key=lambda g: (g["position"] is None, g["position"] or 0)):
+        index = next(
+            (
+                i
+                for i, item in enumerate(items)
+                if group["position"] is not None
+                and ((position := item_position(item)) is None or position > group["position"])
+            ),
+            len(items),
+        )
+        items.insert(index, (group, []))
     return items
 
 
 def save_items(*boards):
-    """Store the order of each (board id, items) pair, giving each task that board and group."""
-    order = []
+    """Store the order of each (board id, items) pair, giving each task that board and its item's group,
+    and each group its place among the tasks."""
+    tasks, groups = [], []
     for board_id, items in boards:
-        for _, tasks in items:
-            for task in tasks:
-                task["board_id"] = board_id
-                order.append(task)
-    task_store.save_order(order)
+        for group, item_tasks in items:
+            if group:
+                groups.append({**group, "board_id": board_id, "position": len(tasks) + len(groups)})
+            for task in item_tasks:
+                task.update(
+                    board_id=board_id,
+                    group=group["name"] if group else None,
+                    position=len(tasks) + len(groups),
+                )
+                tasks.append(task)
+    task_store.save_order(tasks, groups)
 
 
 def find_item(items, ref):
     """The index of the item a dropped {"kind": "task" or "group", "id": ...} refers to, else the end."""
-    for i, (key, tasks) in enumerate(items):
+    for i, (group, tasks) in enumerate(items):
         if ref and (
-            (ref["kind"] == "group" and key and group_dom_id(key) == ref["id"])
-            or (ref["kind"] == "task" and key is None and tasks and tasks[0]["id"] == ref["id"])
+            (ref["kind"] == "group" and group and group_dom_id(group["key"]) == ref["id"])
+            or (ref["kind"] == "task" and group is None and tasks and tasks[0]["id"] == ref["id"])
         ):
             return i
     return len(items)
 
 
+def find_group_item(items, dom_id):
+    return next((item for item in items if item[0] and group_dom_id(item[0]["key"]) == dom_id), None)
+
+
 def remove_task(items, task):
-    """Take the task out of its item. An emptied item stays as a placeholder; it stores nothing."""
+    """Take the task out of its item. An emptied task item stays as a placeholder that stores nothing;
+    an emptied group stays where it is."""
     for _, tasks in items:
         if task in tasks:
             tasks.remove(task)
@@ -161,39 +198,44 @@ def remove_task(items, task):
 
 def move_task(task, group_id, before):
     items = board_items(task["board_id"])
-    group = next((tasks for key, tasks in items if key and group_dom_id(key) == group_id), None)
+    target = find_group_item(items, group_id)
     remove_task(items, task)
-    if group is not None:
-        # Adopt the group's spelling, as groups are matched case-insensitively.
-        task["group"] = group[0]["group"] if group else task["group"]
-        index = next((i for i, t in enumerate(group) if before and t["id"] == before["id"]), len(group))
-        group.insert(index, task)
+    if target:
+        tasks = target[1]
+        index = next((i for i, t in enumerate(tasks) if before and t["id"] == before["id"]), len(tasks))
+        tasks.insert(index, task)
     else:
-        task["group"] = None
         items.insert(find_item(items, before), (None, [task]))
     save_items((task["board_id"], items))
 
 
-def move_group(board_id, key, before):
+def move_group(board_id, group_id, before):
     items = board_items(board_id)
-    item = next(item for item in items if item[0] == key)
+    item = find_group_item(items, group_id)
     items.remove(item)
     items.insert(find_item(items, before), item)
     save_items((board_id, items))
 
 
-def move_to_board(tasks, board_id):
-    """Move the tasks to the end of their group on another board, or of that board if they have none."""
-    source_id = tasks[0]["board_id"]
+def move_to_board(source_id, board_id, tasks, group=None):
+    """Move the tasks to the end of their group on another board (adding the group there if it's
+    missing), or of that board if they have none. Pass their group to move it along with them; otherwise
+    it stays on its board."""
     source, target = board_items(source_id), board_items(board_id)
+    if group:
+        source = [item for item in source if not (item[0] and item[0]["key"] == group["key"])]
+        if not any(g and g["key"] == group["key"] for g, _ in target):
+            target.append((group, []))
     for task in tasks:
         remove_task(source, task)
         key = group_key(task)
-        if group := next((t for k, t in target if key and k == key), None):
-            group.append(task)
+        if item := next((item for item in target if key and item[0] and item[0]["key"] == key), None):
+            item[1].append(task)
         else:
-            target.append((key, [task]))
+            target.append((next((g for g, _ in source if g and g["key"] == key), None), [task]))
     save_items((source_id, source), (board_id, target))
+    if group:
+        task_store.delete_group(source_id, group["key"])
 
 
 def handle_drop(board_id, drop):
@@ -207,18 +249,16 @@ def handle_drop(board_id, drop):
         if not task or task["board_id"] != board_id:
             return
         if drop["board"]:
-            move_to_board([task], drop["board"])
+            move_to_board(board_id, drop["board"], [task])
         else:
             move_task(task, drop["group"], drop["before"])
     elif drop["kind"] == "group":
-        items = board_items(board_id)
-        key = next((k for k, _ in items if k and group_dom_id(k) == drop["id"]), None)
-        if not key:
+        if not (item := find_group_item(board_items(board_id), drop["id"])):
             return
         if drop["board"]:
-            move_to_board(next(tasks for k, tasks in items if k == key), drop["board"])
+            move_to_board(board_id, drop["board"], item[1], item[0])
         else:
-            move_group(board_id, key, drop["before"])
+            move_group(board_id, drop["id"], drop["before"])
 
 
 def group_color(group):
@@ -247,8 +287,10 @@ def clean_tags(tags):
     return list(cleaned.values())
 
 
-# The open_dialog values that refer to a board rather than a task, e.g. ("board", board id).
+# The open_dialog values that refer to a board or a group rather than a task: ("board", board id) and
+# ("group", board id, lowercased group name).
 BOARD_DIALOG = "board"
+GROUP_DIALOG = "group"
 
 
 def board_url_path(name, board_id=None):
@@ -317,8 +359,8 @@ def board_form(board=None):
 
 def close_dialog():
     st.session_state.open_dialog = None
-    # A pending "delete this board?" question shouldn't outlive its dialog.
-    st.session_state.pop("confirm_delete_board", None)
+    # A pending "delete this board?" or "delete this group?" question shouldn't outlive its dialog.
+    st.session_state.pop("confirm_delete", None)
 
 
 def task_form(board_id, task=None):
@@ -337,12 +379,12 @@ def task_form(board_id, task=None):
             accept_new_options=True,
             placeholder="Choose or type a new tag",
         )
-        groups = board_groups(board_id)
-        current_group = task.get("group") if task else None
+        groups = sorted((g["name"] for g in board_groups(board_id)), key=str.lower)
+        current_key = group_key(task) if task else None
         group = st.selectbox(
             "Group (optional)",
             options=[None, *groups],
-            index=groups.index(current_group) + 1 if current_group in groups else 0,
+            index=next((i + 1 for i, g in enumerate(groups) if g.lower() == current_key), 0),
             format_func=lambda g: "No group" if g is None else g,
             accept_new_options=True,
         )
@@ -363,11 +405,13 @@ def task_form(board_id, task=None):
     if not name:
         st.error("Task name is required.")
         return None
+    group = (group or "").strip() or None
     fields = {
         "name": name,
         "description": description.strip(),
         "tags": clean_tags(tags),
-        "group": (group or "").strip() or None,
+        # A new group typed with another case is the existing group.
+        "group": next((g for g in groups if group and g.lower() == group.lower()), group),
         "due_date": due_date,
     }
     if not task:
@@ -452,12 +496,11 @@ def delete_board(board):
 
 
 def _set_confirm_delete(value):
-    st.session_state.confirm_delete_board = value
+    st.session_state.confirm_delete = value
 
 
 @st.dialog("Edit board", on_dismiss=close_dialog)
-def edit_board_dialog(board, is_current):
-    """Rename the board, change its icon or delete it; `is_current` if it's the page being shown."""
+def edit_board_dialog(board):
     if fields := board_form(board):
         icon = fields["icon"] or board["icon"]
         # The default board is served at the app's root, whatever its path; the others follow their name.
@@ -465,7 +508,7 @@ def edit_board_dialog(board, is_current):
         if not board["is_default"] and fields["name"] != board["name"]:
             url_path = board_url_path(fields["name"], board["id"])
         task_store.update_board(board["id"], fields["name"], icon, url_path)
-        if is_current and url_path != board["url_path"]:
+        if url_path != board["url_path"]:
             # The browser is still at the old path; the page at the new one exists from the next run on.
             st.session_state.switch_to_board = board["id"]
         board.update(name=fields["name"], icon=icon, url_path=url_path)
@@ -481,7 +524,7 @@ def edit_board_dialog(board, is_current):
     tasks = board_tasks(board["id"])
     files = sum(len(t.get("files", [])) for t in tasks)
     with st.container(horizontal=True, vertical_alignment="center"):
-        if not st.session_state.get("confirm_delete_board"):
+        if not st.session_state.get("confirm_delete"):
             st.caption("Deleting the board also deletes its tasks and their files.")
             st.space("stretch")
             st.button(
@@ -500,11 +543,49 @@ def edit_board_dialog(board, is_current):
                 delete_board(board)
             st.session_state.boards.remove(board)
             st.session_state.deleted_board = board["name"]
-            if is_current:
-                # The deleted board's page is gone on the next run, so land on the default board.
-                st.session_state.switch_to_board = next(
-                    b["id"] for b in st.session_state.boards if b["is_default"]
-                )
+            # The deleted board's page is gone on the next run, so land on the default board.
+            st.session_state.switch_to_board = next(
+                b["id"] for b in st.session_state.boards if b["is_default"]
+            )
+            close_dialog()
+            st.rerun()
+
+
+@st.dialog("Edit group", on_dismiss=close_dialog)
+def edit_group_dialog(group):
+    board_id, key = group["board_id"], group["key"]
+    with st.form(f"group_form_{group_dom_id(key)}", border=False):
+        name = st.text_input("Name", value=group["name"])
+        submitted = st.form_submit_button("Save", icon=":material/check:", type="primary")
+    if submitted:
+        name = name.strip()
+        if not name:
+            st.error("Group name is required.")
+        elif name.lower() != key and (existing := find_group(board_id, name.lower())):
+            st.error(f"A group named **{existing['name']}** already exists.")
+        else:
+            colors = st.session_state.group_colors
+            # Colors are kept per name; the group keeps its own unless its new name already has one.
+            if name.lower() not in colors and key in colors:
+                task_store.save_group_color(st.session_state.account["id"], name.lower(), colors[key])
+            task_store.rename_group(board_id, key, name)
+            close_dialog()
+            st.rerun()
+
+    st.divider()
+    tasks = [t for t in board_tasks(board_id) if group_key(t) == key and t["done_at"] is None]
+    with st.container(horizontal=True, vertical_alignment="center"):
+        if not st.session_state.get("confirm_delete"):
+            st.caption("Deleting the group keeps its tasks on the board, without a group.")
+            st.space("stretch")
+            st.button(
+                "Delete group", icon=":material/delete:", on_click=_set_confirm_delete, args=(True,)
+            )
+            return
+        st.markdown(f"Delete **{group['name']}**? Its {len(tasks)} tasks stay on the board.")
+        st.button("Cancel", on_click=_set_confirm_delete, args=(False,))
+        if st.button("Delete", icon=":material/delete:", type="primary"):
+            task_store.delete_group(board_id, key)
             close_dialog()
             st.rerun()
 
@@ -555,14 +636,30 @@ def board_page(board_id):
     with st.container(horizontal=True, vertical_alignment="center"):
         st.title(board["name"], icon=board.get("icon", DEFAULT_BOARD_ICON))
         st.space("stretch")
+        if st.button(
+            ":material/edit:",
+            key=f"edit_board_{board_id}",
+            help="Rename the board, change its icon or delete it",
+        ):
+            st.session_state.open_dialog = (BOARD_DIALOG, board_id)
         if st.button("Add task", icon=":material/add:", type="primary"):
             st.session_state.open_dialog = "add"
 
     dialog = st.session_state.open_dialog
     if dialog == "add":
         add_task_dialog(board_id)
-    elif dialog == "new_board" or (isinstance(dialog, tuple) and dialog[0] == BOARD_DIALOG):
-        pass  # Opened below the sidebar, so they work on every page.
+    elif dialog == "new_board":
+        pass  # Opened below the sidebar, so it works on every page.
+    elif isinstance(dialog, tuple) and dialog[0] == BOARD_DIALOG:
+        if dialog[1] == board_id:
+            edit_board_dialog(board)
+        else:
+            close_dialog()
+    elif isinstance(dialog, tuple) and dialog[0] == GROUP_DIALOG:
+        if dialog[1] == board_id and (group := find_group(board_id, dialog[2])):
+            edit_group_dialog(group)
+        else:
+            close_dialog()
     elif isinstance(dialog, tuple):
         task = find_task(dialog[1])
         if dialog[0] == "attach" and task:
@@ -586,13 +683,14 @@ def board_page(board_id):
         # Ungrouped tasks and group boxes in board order (see board_items). Completed tasks go to the
         # top of their group, or of the board when ungrouped (most recent first).
         items = []
-        for key, item_tasks in board_items(board_id):
+        for group, item_tasks in board_items(board_id):
             visible = [t for t in item_tasks if (age := done_age(t)) is None or age < HIDE_AFTER]
             done = sorted((t for t in visible if t["done_at"] is not None), key=lambda t: -t["done_at"])
-            if visible:
-                items.append((key, done + [t for t in visible if t["done_at"] is None]))
+            # A group stays on the board when it has no tasks left; it can be deleted from its box.
+            if visible or group:
+                items.append((group, done + [t for t in visible if t["done_at"] is None]))
         done_ungrouped = sorted(
-            (tasks[0] for key, tasks in items if key is None and tasks[0]["done_at"] is not None),
+            (tasks[0] for group, tasks in items if group is None and tasks[0]["done_at"] is not None),
             key=lambda t: -t["done_at"],
         )
 
@@ -601,17 +699,27 @@ def board_page(board_id):
 
         for task in done_ungrouped:
             task_row(task)
-        for key, group_tasks in items:
-            if key is None:
+        for group, group_tasks in items:
+            if group is None:
                 if group_tasks[0]["done_at"] is None:
                     task_row(group_tasks[0])
                 continue
-            group = group_tasks[0]["group"]
-            color = group_color(group)
+            color = group_color(group["name"])
+            dom_id = group_dom_id(group["key"])
             # The color in the key lets the CSS tint the box; the id keeps keys unique per group.
-            with st.container(border=True, key=f"group_{color}_{group_dom_id(key)}"):
-                icon = f':color[:material/folder:]{{foreground="rgb({GROUP_COLORS[color]})"}}'
-                st.markdown(f"{icon} **{group}** :small[:gray[{len(group_tasks)}]]")
+            with st.container(border=True, key=f"group_{color}_{dom_id}"):
+                with st.container(horizontal=True, vertical_alignment="center"):
+                    icon = f':color[:material/folder:]{{foreground="rgb({GROUP_COLORS[color]})"}}'
+                    st.markdown(f"{icon} **{group['name']}** :small[:gray[{len(group_tasks)}]]")
+                    st.space("stretch")
+                    if st.button(
+                        ":material/edit:",
+                        key=f"edit_group_{dom_id}",
+                        help="Rename or delete the group",
+                        type="tertiary",
+                    ):
+                        st.session_state.open_dialog = (GROUP_DIALOG, board_id, group["key"])
+                        st.rerun()
                 for task in group_tasks:
                     task_row(task)
 
@@ -743,6 +851,7 @@ account["id"] = task_store.ensure_account(account["identity"], account["name"], 
 st.session_state.account = account
 st.session_state.boards = task_store.load_boards(account["id"])
 st.session_state.tasks = task_store.load_tasks(account["id"])
+st.session_state.groups = task_store.load_groups(account["id"])
 # Lowercased group name -> color.
 st.session_state.group_colors = task_store.load_group_colors(account["id"])
 
@@ -771,21 +880,12 @@ with st.sidebar:
     st.subheader("Boards")
     for board in st.session_state.boards:
         # Keyed so tasks and groups can be dragged onto the board.
-        with st.container(
-            key=f"board_link_{board['id']}", horizontal=True, vertical_alignment="center", gap=None
-        ):
+        with st.container(key=f"board_link_{board['id']}"):
             st.page_link(
                 pages[board["id"]],
                 label=f"{board['name']} :small[:gray[{open_task_count(board['id'])}]]",
                 width="stretch",
             )
-            if st.button(
-                ":material/edit:",
-                key=f"edit_board_{board['id']}",
-                help="Rename the board, change its icon or delete it",
-                type="tertiary",
-            ):
-                st.session_state.open_dialog = (BOARD_DIALOG, board["id"])
     if st.button("New board", icon=":material/add:", type="tertiary"):
         st.session_state.open_dialog = "new_board"
     # Pushes everything below to the bottom of the sidebar.
@@ -795,15 +895,9 @@ with st.sidebar:
     st.divider()
     account_sidebar(account, pages.get("admin"))
 
-# Opened here rather than on the board page, so they also work on the admin panel.
-dialog = st.session_state.open_dialog
-if dialog == "new_board":
+# Opened here rather than on the board page, so it also works on the admin panel.
+if st.session_state.open_dialog == "new_board":
     new_board_dialog()
-elif isinstance(dialog, tuple) and dialog[0] == BOARD_DIALOG:
-    if board := next((b for b in st.session_state.boards if b["id"] == dialog[1]), None):
-        edit_board_dialog(board, is_current=current_page is pages[board["id"]])
-    else:
-        close_dialog()  # Deleted in another session meanwhile.
 if name := st.session_state.pop("deleted_board", None):
     st.toast(f"Deleted the board **{name}**.", icon=":material/delete:")
 
