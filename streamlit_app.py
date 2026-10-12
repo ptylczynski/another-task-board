@@ -8,6 +8,7 @@ from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
 
+import file_store
 import task_store
 from admin_panel import ADMIN_URL_PATH, admin_page
 from auth_gate import ACCOUNT_CSS, account_sidebar, require_login
@@ -49,7 +50,7 @@ st.set_page_config(page_title="Task board", page_icon=":material/checklist:")
 # The signed-in account and its boards, tasks and group colors are loaded from the database on every
 # full run (see below), so changes made in other sessions show up too. Changes are written through to
 # the database.
-# None, "add", "new_board", the id of the task being edited, ("attach", task id),
+# None, "add", "new_board", the id of the task being edited, ("board", board id), ("attach", task id),
 # or ("file", task id, file id).
 st.session_state.setdefault("open_dialog", None)
 
@@ -246,18 +247,78 @@ def clean_tags(tags):
     return list(cleaned.values())
 
 
-def board_url_path(name):
+# The open_dialog values that refer to a board rather than a task, e.g. ("board", board id).
+BOARD_DIALOG = "board"
+
+
+def board_url_path(name, board_id=None):
+    """A URL path for the board name that no other board of the account uses.
+
+    Pass the board's id when renaming it, so it can keep its own path if the name still fits it.
+    """
     slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "board"
     # The admin panel's path is taken for everyone, so no board can hide it.
-    taken = {b["url_path"] for b in st.session_state.boards} | {ADMIN_URL_PATH}
+    taken = {b["url_path"] for b in st.session_state.boards if b["id"] != board_id} | {ADMIN_URL_PATH}
     candidate, n = slug, 2
     while candidate in taken:
         candidate, n = f"{slug}-{n}", n + 1
     return candidate
 
 
+def board_name_taken(name, board_id=None):
+    """The other board of the account with this name (case-insensitively), if any."""
+    return next(
+        (
+            b
+            for b in st.session_state.boards
+            if b["id"] != board_id and b["name"].lower() == name.lower()
+        ),
+        None,
+    )
+
+
+def board_form(board=None):
+    """Render the board fields; return them once submitted and valid, else None."""
+    with st.form(f"board_form_{board['id'] if board else 'new'}", border=False):
+        name = st.text_input(
+            "Name", value=board["name"] if board else "", placeholder="e.g. Work, Home, Side project"
+        )
+        current_icon = board["icon"] if board else None
+        icon = st.selectbox(
+            "Icon" if board else "Icon (optional)",
+            options=EMOJIS,
+            # A board may carry an icon that isn't on the list (e.g. an older default); then nothing is
+            # preselected and leaving it empty keeps that icon.
+            index=EMOJIS.index(current_icon) if current_icon in EMOJIS else None,
+            format_func=emoji_label,
+            filter_mode="contains",
+            placeholder="Search by name or pick from the list",
+            help=(
+                "Leave empty to keep the current icon." if board else "Leave empty to get a random icon."
+            ),
+        )
+        submitted = st.form_submit_button(
+            "Save" if board else "Create",
+            icon=":material/check:" if board else ":material/add:",
+            type="primary",
+        )
+
+    if not submitted:
+        return None
+    name = name.strip()
+    if not name:
+        st.error("Board name is required.")
+        return None
+    if existing := board_name_taken(name, board["id"] if board else None):
+        st.error(f"A board named **{existing['name']}** already exists.")
+        return None
+    return {"name": name, "icon": icon}
+
+
 def close_dialog():
     st.session_state.open_dialog = None
+    # A pending "delete this board?" question shouldn't outlive its dialog.
+    st.session_state.pop("confirm_delete_board", None)
 
 
 def task_form(board_id, task=None):
@@ -359,40 +420,91 @@ def file_dialog(task, file):
 
 @st.dialog("New board", on_dismiss=close_dialog)
 def new_board_dialog():
-    with st.form("new_board_form", border=False):
-        name = st.text_input("Name", placeholder="e.g. Work, Home, Side project")
-        icon = st.selectbox(
-            "Icon (optional)",
-            options=EMOJIS,
-            index=None,
-            format_func=emoji_label,
-            filter_mode="contains",
-            placeholder="Search by name or pick from the list",
-            help="Leave empty to get a random icon.",
-        )
-        submitted = st.form_submit_button("Create", icon=":material/add:", type="primary")
+    if fields := board_form():
+        board = {
+            "id": uuid.uuid4().hex,
+            "name": fields["name"],
+            "icon": fields["icon"] or random_emoji(),
+            "url_path": board_url_path(fields["name"]),
+        }
+        task_store.insert_board(st.session_state.account["id"], board)
+        st.session_state.boards.append(board)
+        # The new board's page only exists from the next run on, so switch to it there.
+        st.session_state.switch_to_board = board["id"]
+        close_dialog()
+        st.rerun()
 
-    if not submitted:
+
+def delete_board(board):
+    """Delete the board's files, then the board with its tasks and file records."""
+    user_id = st.session_state.account["id"]
+    # As stored, not as loaded: another session may have added tasks since.
+    prefixes = [
+        file_store.task_prefix(user_id, task_id) for task_id in task_store.board_task_ids(board["id"])
+    ]
+    # Files go first: if that fails, the board is still there and can be deleted again.
+    for prefix in prefixes:
+        file_store.delete_prefix(prefix)
+    task_store.delete_board(board["id"])
+    # Catches files uploaded to the board by another session while it was being deleted.
+    for prefix in prefixes:
+        file_store.delete_prefix(prefix)
+
+
+def _set_confirm_delete(value):
+    st.session_state.confirm_delete_board = value
+
+
+@st.dialog("Edit board", on_dismiss=close_dialog)
+def edit_board_dialog(board):
+    if fields := board_form(board):
+        icon = fields["icon"] or board["icon"]
+        # The default board is served at the app's root, whatever its path; the others follow their name.
+        url_path = board["url_path"]
+        if not board["is_default"] and fields["name"] != board["name"]:
+            url_path = board_url_path(fields["name"], board["id"])
+        task_store.update_board(board["id"], fields["name"], icon, url_path)
+        if url_path != board["url_path"]:
+            # The browser is still at the old path; the page at the new one exists from the next run on.
+            st.session_state.switch_to_board = board["id"]
+        board.update(name=fields["name"], icon=icon, url_path=url_path)
+        close_dialog()
+        st.rerun()
+
+    st.divider()
+    if board["is_default"]:
+        st.caption(
+            "This is your default board, the one you land on after signing in. It can't be deleted."
+        )
         return
-    name = name.strip()
-    if not name:
-        st.error("Board name is required.")
-        return
-    if existing := next((b for b in st.session_state.boards if b["name"].lower() == name.lower()), None):
-        st.error(f"A board named **{existing['name']}** already exists.")
-        return
-    board = {
-        "id": uuid.uuid4().hex,
-        "name": name,
-        "icon": icon or random_emoji(),
-        "url_path": board_url_path(name),
-    }
-    task_store.insert_board(st.session_state.account["id"], board)
-    st.session_state.boards.append(board)
-    # The new board's page only exists from the next run on, so switch to it there.
-    st.session_state.switch_to_board = board["id"]
-    close_dialog()
-    st.rerun()
+    tasks = board_tasks(board["id"])
+    files = sum(len(t.get("files", [])) for t in tasks)
+    with st.container(horizontal=True, vertical_alignment="center"):
+        if not st.session_state.get("confirm_delete_board"):
+            st.caption("Deleting the board also deletes its tasks and their files.")
+            st.space("stretch")
+            st.button(
+                "Delete board", icon=":material/delete:", on_click=_set_confirm_delete, args=(True,)
+            )
+            return
+        st.markdown(
+            f"Delete **{board['name']}** with its {len(tasks)} tasks and {files} files? "
+            "It can't be undone."
+        )
+        st.button("Cancel", on_click=_set_confirm_delete, args=(False,))
+        if st.button(
+            "Delete", icon=":material/delete:", type="primary", key=f"board_delete_{board['id']}"
+        ):
+            with st.spinner("Deleting files and tasks..."):
+                delete_board(board)
+            st.session_state.boards.remove(board)
+            st.session_state.deleted_board = board["name"]
+            # The deleted board's page is gone on the next run, so land on the default board.
+            st.session_state.switch_to_board = next(
+                b["id"] for b in st.session_state.boards if b["is_default"]
+            )
+            close_dialog()
+            st.rerun()
 
 
 def open_edit_dialog(task_id):
@@ -437,9 +549,18 @@ def task_row(task):
 
 def board_page(board_id):
     board = next(b for b in st.session_state.boards if b["id"] == board_id)
+    if name := st.session_state.pop("deleted_board", None):
+        st.toast(f"Deleted the board **{name}**.", icon=":material/delete:")
 
     with st.container(horizontal=True, vertical_alignment="center"):
         st.title(board["name"], icon=board.get("icon", DEFAULT_BOARD_ICON))
+        if st.button(
+            ":material/edit:",
+            key=f"edit_board_{board_id}",
+            help="Rename the board, change its icon or delete it",
+            type="tertiary",
+        ):
+            st.session_state.open_dialog = (BOARD_DIALOG, board_id)
         st.space("stretch")
         if st.button("Add task", icon=":material/add:", type="primary"):
             st.session_state.open_dialog = "add"
@@ -449,6 +570,11 @@ def board_page(board_id):
         add_task_dialog(board_id)
     elif dialog == "new_board":
         pass  # Opened below the sidebar, so it works on every page.
+    elif isinstance(dialog, tuple) and dialog[0] == BOARD_DIALOG:
+        if dialog[1] == board_id:
+            edit_board_dialog(board)
+        else:
+            close_dialog()
     elif isinstance(dialog, tuple):
         task = find_task(dialog[1])
         if dialog[0] == "attach" and task:
