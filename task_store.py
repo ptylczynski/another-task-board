@@ -175,6 +175,29 @@ def insert_board(user_id, board):
     )
 
 
+def update_board(board_id, name, icon, url_path):
+    _execute(
+        "UPDATE boards SET name = :name, icon = :icon, url_path = :url_path WHERE id = :id",
+        {"id": board_id, "name": name, "icon": icon, "url_path": url_path},
+    )
+
+
+def board_task_ids(board_id):
+    """The ids of the board's tasks as stored, including ones added by other sessions."""
+    rows = _rows("SELECT id FROM tasks WHERE board_id = :board_id", {"board_id": board_id})
+    return [row["id"] for row in rows]
+
+
+def delete_board(board_id):
+    """Delete the board with its tasks and file records (not the files' contents).
+
+    The default board is every account's landing page, so it's left alone; returns whether the board
+    was deleted.
+    """
+    result = _execute("DELETE FROM boards WHERE id = :id AND NOT is_default", {"id": board_id})
+    return result.rowcount == 1
+
+
 def _file(row):
     return {
         "id": row["id"],

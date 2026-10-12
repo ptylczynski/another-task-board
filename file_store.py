@@ -67,8 +67,13 @@ def account_prefix(user_id):
     return f"users/{user_id}/"
 
 
+def task_prefix(user_id, task_id):
+    # Likewise for a task's files, so deleting a task or its board can sweep them.
+    return f"{account_prefix(user_id)}tasks/{task_id}/"
+
+
 def object_key(user_id, task_id, file_id):
-    return f"{account_prefix(user_id)}tasks/{task_id}/{file_id}"
+    return f"{task_prefix(user_id, task_id)}{file_id}"
 
 
 def _ensure_bucket():
