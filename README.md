@@ -36,6 +36,8 @@ The app follows your system's light or dark theme.
 - **Accounts**: the administrator signs in with a login and password; everyone else signs in with
   OIDC and gets their own account on first sign-in. The administrator's admin panel lists every
   account with how much it stores, and can delete an account with all its data.
+- **MCP server**: AI assistants such as Claude can list, add, change and complete your tasks, each
+  with an access token that you create in the app (see [below](#connecting-an-ai-assistant-mcp)).
 
 ## Running with Docker Compose
 
@@ -122,15 +124,36 @@ The OIDC variables only take effect when the app is started with `streamlit run 
 Alternatively, configure OIDC under `[auth]` in `.streamlit/secrets.toml`, which also allows several
 named providers. With no login method configured, access is blocked.
 
+## Connecting an AI assistant (MCP)
+
+The app serves an [MCP](https://modelcontextprotocol.io) server at `/mcp`, next to the app
+(e.g. <http://localhost:8501/mcp>), over Streamable HTTP. It's only served when the app is started
+with `streamlit run asgi_app.py`, as the Docker image does.
+
+Each request needs an access token. To create one, click **MCP access** in the sidebar, name the token
+and copy it: it's shown only once. The dialog also lists your tokens with when they were last used,
+and revokes them. An assistant using a token works on the boards of the account that created it.
+For example, to connect Claude Code:
+
+```sh
+claude mcp add --transport http task-board http://localhost:8501/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
+The tools are `list_boards`, `list_tasks`, `add_task`, `update_task`, `complete_task` and
+`reopen_task`. Boards are named by their name or id, and tasks by their id, which `list_tasks` shows.
+Attachments are listed by name only.
+
 ## Project layout
 
 | File | |
 | --- | --- |
-| `asgi_app.py` | Entry point; passes the OIDC variables to Streamlit |
+| `asgi_app.py` | Entry point; passes the OIDC variables to Streamlit and serves the MCP server |
 | `streamlit_app.py` | The boards, tasks and dialogs |
 | `auth_gate.py` | Login page and accounts |
 | `admin_panel.py` | Admin panel |
 | `task_store.py` | Accounts, boards, tasks and attachment metadata in PostgreSQL |
+| `mcp_server.py` | MCP server and its access token check |
 | `db.py` | Database connection |
 | `file_store.py` | Attachment contents in S3 |
 | `task_files.py` | Attachment UI |

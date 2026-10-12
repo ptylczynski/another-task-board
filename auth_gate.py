@@ -198,13 +198,20 @@ def require_login(url_paths=()):
     return account
 
 
-def account_sidebar(account, admin_page=None):
-    """The signed-in user, set apart from the links below it: `admin_page` (if given) and log out."""
+def _mcp_access_button(on_mcp_access):
+    if on_mcp_access:
+        st.button("MCP access", icon=":material/key:", type="tertiary", on_click=on_mcp_access)
+
+
+def account_sidebar(account, admin_page=None, on_mcp_access=None):
+    """The signed-in user, set apart from the links below it: `admin_page` (if given), a button that
+    calls `on_mcp_access` (if given) and log out."""
     if account["method"] == "disabled":
         st.caption(
             f":material/lock_open: Authentication is disabled (`{AUTH_DISABLED_ENV}`).",
             help="Anyone who can reach this app can use it. Unset the variable to require login.",
         )
+        _mcp_access_button(on_mcp_access)
         return
     with st.container(key="sidebar_account", gap="xsmall"):
         role = " :small[:gray[Administrator]]" if account["is_admin"] else ""
@@ -212,6 +219,7 @@ def account_sidebar(account, admin_page=None):
             st.markdown(f":material/account_circle: **{account['name']}**{role}")
         if admin_page:
             st.page_link(admin_page, width="stretch")
+        _mcp_access_button(on_mcp_access)
         if st.button("Log out", icon=":material/logout:", type="tertiary"):
             if account["method"] == "oidc":
                 st.logout()

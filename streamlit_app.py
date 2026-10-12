@@ -2,8 +2,10 @@ import re
 import time
 import uuid
 import zlib
+from datetime import datetime
 from functools import partial
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -16,6 +18,7 @@ from board_icons import EMOJIS, emoji_label, random_emoji
 from db import connection_error, database_sidebar, db_configured
 from file_store import file_storage_sidebar, s3_configured
 from file_store import connection_error as file_storage_error
+from mcp_server import MCP_PATH, new_token
 from task_dblclick import task_dblclick_listener
 from task_dnd import task_drag_and_drop
 from task_files import (
@@ -50,7 +53,7 @@ st.set_page_config(page_title="Task board", page_icon=":material/checklist:")
 # The signed-in account and its boards, tasks and group colors are loaded from the database on every
 # full run (see below), so changes made in other sessions show up too. Changes are written through to
 # the database.
-# None, "add", "new_board", the id of the task being edited, ("board", board id),
+# None, "add", "new_board", "mcp_access", the id of the task being edited, ("board", board id),
 # ("group", board id, group key), ("attach", task id), or ("file", task id, file id).
 st.session_state.setdefault("open_dialog", None)
 
@@ -277,20 +280,11 @@ def tag_badge(tag):
     return f":{color}-badge[{tag}]"
 
 
-def clean_tags(tags):
-    cleaned = {}
-    for tag in tags:
-        # Brackets would break the badge Markdown.
-        tag = tag.replace("[", "").replace("]", "").strip()
-        if tag:
-            cleaned.setdefault(tag.lower(), tag)
-    return list(cleaned.values())
-
-
-# The open_dialog values that refer to a board or a group rather than a task: ("board", board id) and
-# ("group", board id, lowercased group name).
+# The open_dialog values that refer to a board or a group rather than a task: ("board", board id),
+# ("group", board id, lowercased group name) and ("add_to_group", board id, lowercased group name).
 BOARD_DIALOG = "board"
 GROUP_DIALOG = "group"
+ADD_TO_GROUP_DIALOG = "add_to_group"
 
 
 def board_url_path(name, board_id=None):
@@ -361,10 +355,15 @@ def close_dialog():
     st.session_state.open_dialog = None
     # A pending "delete this board?" or "delete this group?" question shouldn't outlive its dialog.
     st.session_state.pop("confirm_delete", None)
+    # Nor should a new access token, which is shown only once.
+    st.session_state.pop("new_access_token", None)
 
 
-def task_form(board_id, task=None):
-    """Render the task fields; return them once submitted and valid, else None."""
+def task_form(board_id, task=None, new_group_key=None):
+    """Render the task fields; return them once submitted and valid, else None.
+
+    For a new task, pass a lowercased group name to preselect that group.
+    """
     with st.form(f"task_form_{task['id'] if task else 'new'}", border=False):
         name = st.text_input(
             "Name", value=task["name"] if task else "", placeholder="What needs to be done?"
@@ -380,7 +379,7 @@ def task_form(board_id, task=None):
             placeholder="Choose or type a new tag",
         )
         groups = sorted((g["name"] for g in board_groups(board_id)), key=str.lower)
-        current_key = group_key(task) if task else None
+        current_key = group_key(task) if task else new_group_key
         group = st.selectbox(
             "Group (optional)",
             options=[None, *groups],
@@ -409,7 +408,7 @@ def task_form(board_id, task=None):
     fields = {
         "name": name,
         "description": description.strip(),
-        "tags": clean_tags(tags),
+        "tags": task_store.clean_tags(tags),
         # A new group typed with another case is the existing group.
         "group": next((g for g in groups if group and g.lower() == group.lower()), group),
         "due_date": due_date,
@@ -421,8 +420,8 @@ def task_form(board_id, task=None):
 
 # Dialogs are opened via session state so they survive full reruns triggered by the task timer.
 @st.dialog("Add task", on_dismiss=close_dialog)
-def add_task_dialog(board_id):
-    if fields := task_form(board_id):
+def add_task_dialog(board_id, new_group_key=None):
+    if fields := task_form(board_id, new_group_key=new_group_key):
         uploads = fields.pop("uploads")
         task = {
             "id": uuid.uuid4().hex,
@@ -477,6 +476,77 @@ def new_board_dialog():
         st.session_state.switch_to_board = board["id"]
         close_dialog()
         st.rerun()
+
+
+def mcp_url():
+    """The MCP server's URL as this browser reaches the app."""
+    url = urlsplit(st.context.url)
+    return f"{url.scheme}://{url.netloc}{MCP_PATH}"
+
+
+def format_time(seconds):
+    return datetime.fromtimestamp(seconds).strftime("%Y-%m-%d %H:%M")
+
+
+def revoke_access_token(user_id, token_id):
+    task_store.delete_access_token(user_id, token_id)
+    # A just-created token that's revoked again is no use to copy.
+    if (st.session_state.get("new_access_token") or {}).get("id") == token_id:
+        del st.session_state.new_access_token
+
+
+@st.dialog("MCP access", width="medium", on_dismiss=close_dialog)
+def mcp_access_dialog():
+    user_id = st.session_state.account["id"]
+    st.markdown(
+        "AI assistants such as Claude can work with your boards through MCP: list, add, change and "
+        "complete your tasks. Connect one to this address with an access token."
+    )
+    url = mcp_url()
+    st.code(url, language=None)
+    if new := st.session_state.get("new_access_token"):
+        token = new["token"]
+        st.success("Copy the new token now: it won't be shown again.", icon=":material/key:")
+        st.code(token, language=None)
+        st.caption("For example, to connect Claude Code:")
+        st.code(
+            f'claude mcp add --transport http task-board {url} --header "Authorization: Bearer {token}"',
+            language="bash",
+            wrap_lines=True,
+        )
+
+    with st.form("access_token_form", border=False, clear_on_submit=True):
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            name = st.text_input("New access token", placeholder="e.g. Claude Code on my laptop")
+            submitted = st.form_submit_button("Create", icon=":material/add:")
+    if submitted:
+        if name := name.strip():
+            token = new_token()
+            token_id = task_store.insert_access_token(user_id, name, token)
+            st.session_state.new_access_token = {"id": token_id, "token": token}
+            st.rerun()
+        st.error("Token name is required.")
+
+    for token in task_store.load_access_tokens(user_id):
+        with st.container(horizontal=True, vertical_alignment="center"):
+            last_used = format_time(token["last_used_at"]) if token["last_used_at"] else "never"
+            st.markdown(
+                f"**{token['name']}**  \n"
+                f":small[:gray[Created {format_time(token['created_at'])} · last used {last_used}]]"
+            )
+            st.space("stretch")
+            st.button(
+                ":material/delete:",
+                key=f"delete_access_token_{token['id']}",
+                help="Revoke this token; anything using it loses access",
+                type="tertiary",
+                on_click=revoke_access_token,
+                args=(user_id, token["id"]),
+            )
+
+
+def open_mcp_access_dialog():
+    st.session_state.open_dialog = "mcp_access"
 
 
 def delete_board(board):
@@ -648,8 +718,8 @@ def board_page(board_id):
     dialog = st.session_state.open_dialog
     if dialog == "add":
         add_task_dialog(board_id)
-    elif dialog == "new_board":
-        pass  # Opened below the sidebar, so it works on every page.
+    elif dialog in ("new_board", "mcp_access"):
+        pass  # Opened below the sidebar, so they work on every page.
     elif isinstance(dialog, tuple) and dialog[0] == BOARD_DIALOG:
         if dialog[1] == board_id:
             edit_board_dialog(board)
@@ -658,6 +728,11 @@ def board_page(board_id):
     elif isinstance(dialog, tuple) and dialog[0] == GROUP_DIALOG:
         if dialog[1] == board_id and (group := find_group(board_id, dialog[2])):
             edit_group_dialog(group)
+        else:
+            close_dialog()
+    elif isinstance(dialog, tuple) and dialog[0] == ADD_TO_GROUP_DIALOG:
+        if dialog[1] == board_id and find_group(board_id, dialog[2]):
+            add_task_dialog(board_id, dialog[2])
         else:
             close_dialog()
     elif isinstance(dialog, tuple):
@@ -712,6 +787,14 @@ def board_page(board_id):
                     icon = f':color[:material/folder:]{{foreground="rgb({GROUP_COLORS[color]})"}}'
                     st.markdown(f"{icon} **{group['name']}** :small[:gray[{len(group_tasks)}]]")
                     st.space("stretch")
+                    if st.button(
+                        ":material/add:",
+                        key=f"add_to_group_{dom_id}",
+                        help="Add a task to this group",
+                        type="tertiary",
+                    ):
+                        st.session_state.open_dialog = (ADD_TO_GROUP_DIALOG, board_id, group["key"])
+                        st.rerun()
                     if st.button(
                         ":material/edit:",
                         key=f"edit_group_{dom_id}",
@@ -893,11 +976,13 @@ with st.sidebar:
     database_sidebar()
     file_storage_sidebar()
     st.divider()
-    account_sidebar(account, pages.get("admin"))
+    account_sidebar(account, pages.get("admin"), open_mcp_access_dialog)
 
-# Opened here rather than on the board page, so it also works on the admin panel.
+# Opened here rather than on the board page, so they also work on the admin panel.
 if st.session_state.open_dialog == "new_board":
     new_board_dialog()
+elif st.session_state.open_dialog == "mcp_access":
+    mcp_access_dialog()
 if name := st.session_state.pop("deleted_board", None):
     st.toast(f"Deleted the board **{name}**.", icon=":material/delete:")
 
