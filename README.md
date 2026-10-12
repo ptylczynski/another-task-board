@@ -23,8 +23,8 @@ The app follows your system's light or dark theme.
 ## Features
 
 - **Boards**: as many as you like, each with a name and an emoji icon, listed in the sidebar. The
-  pencil next to a board's title renames it, changes its icon or deletes it with its tasks and files
-  (except the default board, the one you land on after signing in).
+  pencil next to a board in the sidebar renames it, changes its icon or deletes it with its tasks and
+  files (except the default board, the one you land on after signing in).
 - **Tasks**: a name, plus an optional description, tags, group, due date and attached files.
   Double-click a task to edit it. A completed task stays visible for a few seconds and can be undone.
 - **Groups**: tasks in the same group are shown together in a tinted box.
