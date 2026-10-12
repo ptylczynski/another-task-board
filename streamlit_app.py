@@ -456,7 +456,8 @@ def _set_confirm_delete(value):
 
 
 @st.dialog("Edit board", on_dismiss=close_dialog)
-def edit_board_dialog(board):
+def edit_board_dialog(board, is_current):
+    """Rename the board, change its icon or delete it; `is_current` if it's the page being shown."""
     if fields := board_form(board):
         icon = fields["icon"] or board["icon"]
         # The default board is served at the app's root, whatever its path; the others follow their name.
@@ -464,7 +465,7 @@ def edit_board_dialog(board):
         if not board["is_default"] and fields["name"] != board["name"]:
             url_path = board_url_path(fields["name"], board["id"])
         task_store.update_board(board["id"], fields["name"], icon, url_path)
-        if url_path != board["url_path"]:
+        if is_current and url_path != board["url_path"]:
             # The browser is still at the old path; the page at the new one exists from the next run on.
             st.session_state.switch_to_board = board["id"]
         board.update(name=fields["name"], icon=icon, url_path=url_path)
@@ -499,10 +500,11 @@ def edit_board_dialog(board):
                 delete_board(board)
             st.session_state.boards.remove(board)
             st.session_state.deleted_board = board["name"]
-            # The deleted board's page is gone on the next run, so land on the default board.
-            st.session_state.switch_to_board = next(
-                b["id"] for b in st.session_state.boards if b["is_default"]
-            )
+            if is_current:
+                # The deleted board's page is gone on the next run, so land on the default board.
+                st.session_state.switch_to_board = next(
+                    b["id"] for b in st.session_state.boards if b["is_default"]
+                )
             close_dialog()
             st.rerun()
 
@@ -549,18 +551,9 @@ def task_row(task):
 
 def board_page(board_id):
     board = next(b for b in st.session_state.boards if b["id"] == board_id)
-    if name := st.session_state.pop("deleted_board", None):
-        st.toast(f"Deleted the board **{name}**.", icon=":material/delete:")
 
     with st.container(horizontal=True, vertical_alignment="center"):
         st.title(board["name"], icon=board.get("icon", DEFAULT_BOARD_ICON))
-        if st.button(
-            ":material/edit:",
-            key=f"edit_board_{board_id}",
-            help="Rename the board, change its icon or delete it",
-            type="tertiary",
-        ):
-            st.session_state.open_dialog = (BOARD_DIALOG, board_id)
         st.space("stretch")
         if st.button("Add task", icon=":material/add:", type="primary"):
             st.session_state.open_dialog = "add"
@@ -568,13 +561,8 @@ def board_page(board_id):
     dialog = st.session_state.open_dialog
     if dialog == "add":
         add_task_dialog(board_id)
-    elif dialog == "new_board":
-        pass  # Opened below the sidebar, so it works on every page.
-    elif isinstance(dialog, tuple) and dialog[0] == BOARD_DIALOG:
-        if dialog[1] == board_id:
-            edit_board_dialog(board)
-        else:
-            close_dialog()
+    elif dialog == "new_board" or (isinstance(dialog, tuple) and dialog[0] == BOARD_DIALOG):
+        pass  # Opened below the sidebar, so they work on every page.
     elif isinstance(dialog, tuple):
         task = find_task(dialog[1])
         if dialog[0] == "attach" and task:
@@ -783,12 +771,21 @@ with st.sidebar:
     st.subheader("Boards")
     for board in st.session_state.boards:
         # Keyed so tasks and groups can be dragged onto the board.
-        with st.container(key=f"board_link_{board['id']}"):
+        with st.container(
+            key=f"board_link_{board['id']}", horizontal=True, vertical_alignment="center", gap=None
+        ):
             st.page_link(
                 pages[board["id"]],
                 label=f"{board['name']} :small[:gray[{open_task_count(board['id'])}]]",
                 width="stretch",
             )
+            if st.button(
+                ":material/edit:",
+                key=f"edit_board_{board['id']}",
+                help="Rename the board, change its icon or delete it",
+                type="tertiary",
+            ):
+                st.session_state.open_dialog = (BOARD_DIALOG, board["id"])
     if st.button("New board", icon=":material/add:", type="tertiary"):
         st.session_state.open_dialog = "new_board"
     # Pushes everything below to the bottom of the sidebar.
@@ -798,9 +795,17 @@ with st.sidebar:
     st.divider()
     account_sidebar(account, pages.get("admin"))
 
-# Opened here rather than on the board page, so it also works on the admin panel.
-if st.session_state.open_dialog == "new_board":
+# Opened here rather than on the board page, so they also work on the admin panel.
+dialog = st.session_state.open_dialog
+if dialog == "new_board":
     new_board_dialog()
+elif isinstance(dialog, tuple) and dialog[0] == BOARD_DIALOG:
+    if board := next((b for b in st.session_state.boards if b["id"] == dialog[1]), None):
+        edit_board_dialog(board, is_current=current_page is pages[board["id"]])
+    else:
+        close_dialog()  # Deleted in another session meanwhile.
+if name := st.session_state.pop("deleted_board", None):
+    st.toast(f"Deleted the board **{name}**.", icon=":material/delete:")
 
 if switch_to := st.session_state.pop("switch_to_board", None):
     st.switch_page(pages[switch_to])
