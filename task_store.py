@@ -1,8 +1,9 @@
 """Accounts, boards, tasks and attachment metadata in PostgreSQL. File contents live in S3 (see
 file_store).
 
-Every board belongs to one account, and tasks and their files belong to a board, so deleting an
-account deletes everything it owns. Rows are returned as the dicts the app works with: times as
+Every board belongs to one account, and tasks, groups and files belong to a board, so deleting an
+account deletes everything it owns. A task names its group; the group itself is stored separately so
+it stays on the board when it has no tasks. Rows are returned as the dicts the app works with: times as
 epoch seconds (like time.time()), due dates as datetime.date, and each task's attachments under
 "files". The tables are created on first use.
 """
@@ -73,6 +74,26 @@ SCHEMA = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS task_files_task_id ON task_files (task_id)",
+    """
+    CREATE TABLE IF NOT EXISTS task_groups (
+        board_id text NOT NULL REFERENCES boards (id) ON DELETE CASCADE,
+        -- The lowercased name, as tasks are grouped case-insensitively.
+        group_key text NOT NULL,
+        name text NOT NULL,
+        -- Where the group sits among the board's tasks once something has been dragged (see
+        -- save_order); it places the group only while the group has no tasks.
+        position integer,
+        PRIMARY KEY (board_id, group_key)
+    )
+    """,
+    # Groups used to exist only through their tasks; give each such group its row.
+    """
+    INSERT INTO task_groups (board_id, group_key, name)
+    SELECT DISTINCT ON (board_id, lower(group_name)) board_id, lower(group_name), group_name
+    FROM tasks WHERE group_name IS NOT NULL
+    ORDER BY board_id, lower(group_name), position NULLS LAST, created_at
+    ON CONFLICT DO NOTHING
+    """,
     """
     CREATE TABLE IF NOT EXISTS group_colors (
         user_id text NOT NULL REFERENCES users (id) ON DELETE CASCADE,
@@ -233,6 +254,7 @@ def load_tasks(user_id):
             "group": row["group_name"],
             "due_date": row["due_date"],
             "done_at": _to_seconds(row["done_at"]),
+            "position": row["position"],
             "files": files.get(row["id"], []),
         }
         for row in _rows(
@@ -267,6 +289,17 @@ def _file_params(task_id, file):
     }
 
 
+# Stores the task's group (:key is its lowercased name) on its board unless the board already has it.
+ADD_GROUP = """
+    INSERT INTO task_groups (board_id, group_key, name)
+    SELECT board_id, :key, group_name FROM tasks WHERE id = :id AND group_name IS NOT NULL
+    ON CONFLICT DO NOTHING
+"""
+
+
+def _group_key(fields):
+    return fields["group"].lower() if fields["group"] else None
+
 INSERT_FILE = """
     INSERT INTO task_files (id, task_id, name, type, size, object_key, updated_at)
     VALUES (:id, :task_id, :name, :type, :size, :object_key, :updated_at)
@@ -290,34 +323,114 @@ def insert_task(task):
                 **_task_params(task),
             },
         )
+        conn.execute(sa.text(ADD_GROUP), {"id": task["id"], "key": _group_key(task)})
         if task["files"]:
             conn.execute(sa.text(INSERT_FILE), [_file_params(task["id"], f) for f in task["files"]])
 
 
 def update_task(task_id, fields):
-    _execute(
-        """
-        UPDATE tasks
-        SET name = :name, description = :description, tags = :tags, group_name = :group_name,
-            due_date = :due_date
-        WHERE id = :id
-        """,
-        {"id": task_id, **_task_params(fields)},
-    )
+    with connection().engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                """
+                UPDATE tasks
+                SET name = :name, description = :description, tags = :tags, group_name = :group_name,
+                    due_date = :due_date
+                WHERE id = :id
+                """
+            ),
+            {"id": task_id, **_task_params(fields)},
+        )
+        conn.execute(sa.text(ADD_GROUP), {"id": task_id, "key": _group_key(fields)})
 
 
-def save_order(tasks):
-    """Store each task's board, group and position, as given by its index in `tasks`."""
-    if tasks:
-        _execute(
+def save_order(tasks, groups):
+    """Store each task's board, group and position, and each group's position, adding the groups a
+    board doesn't have yet."""
+    with connection().engine.begin() as conn:
+        if groups:
+            conn.execute(
+                sa.text(
+                    """
+                    INSERT INTO task_groups (board_id, group_key, name, position)
+                    VALUES (:board_id, :key, :name, :position)
+                    ON CONFLICT (board_id, group_key) DO UPDATE SET position = EXCLUDED.position
+                    """
+                ),
+                groups,
+            )
+        if tasks:
+            conn.execute(
+                sa.text(
+                    """
+                    UPDATE tasks SET board_id = :board_id, group_name = :group_name, position = :position
+                    WHERE id = :id
+                    """
+                ),
+                [
+                    {
+                        "id": t["id"],
+                        "board_id": t["board_id"],
+                        "group_name": t["group"],
+                        "position": t["position"],
+                    }
+                    for t in tasks
+                ],
+            )
+
+
+def load_groups(user_id):
+    return [
+        dict(row)
+        for row in _rows(
             """
-            UPDATE tasks SET board_id = :board_id, group_name = :group_name, position = :position
-            WHERE id = :id
+            SELECT g.board_id, g.group_key AS key, g.name, g.position
+            FROM task_groups g JOIN boards b ON b.id = g.board_id
+            WHERE b.user_id = :user_id
             """,
-            [
-                {"id": t["id"], "board_id": t["board_id"], "group_name": t["group"], "position": i}
-                for i, t in enumerate(tasks)
-            ],
+            {"user_id": user_id},
+        )
+    ]
+
+
+def rename_group(board_id, key, name):
+    """Rename the board's group and its tasks' group (`key` is the current lowercased name)."""
+    with connection().engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                """
+                UPDATE task_groups SET group_key = :new_key, name = :name
+                WHERE board_id = :board_id AND group_key = :key
+                """
+            ),
+            {"board_id": board_id, "key": key, "new_key": name.lower(), "name": name},
+        )
+        conn.execute(
+            sa.text(
+                """
+                UPDATE tasks SET group_name = :name
+                WHERE board_id = :board_id AND lower(group_name) = :key
+                """
+            ),
+            {"board_id": board_id, "key": key, "name": name},
+        )
+
+
+def delete_group(board_id, key):
+    """Delete the board's group; its tasks stay where they are, without a group."""
+    with connection().engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                """
+                UPDATE tasks SET group_name = NULL
+                WHERE board_id = :board_id AND lower(group_name) = :key
+                """
+            ),
+            {"board_id": board_id, "key": key},
+        )
+        conn.execute(
+            sa.text("DELETE FROM task_groups WHERE board_id = :board_id AND group_key = :key"),
+            {"board_id": board_id, "key": key},
         )
 
 
